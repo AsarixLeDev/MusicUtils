@@ -1,0 +1,174 @@
+# =========================================
+# Denoiser training config (base-48 tuned)
+# =========================================
+
+paths:
+  runs_root: soundrestorer/runs
+
+# -----------------------------
+# Data / loader
+# -----------------------------
+data:
+  train_manifest: soundrestorer/data/training/train.jsonl
+  val_manifest:   soundrestorer/data/training/val.jsonl
+
+  sr: 48000
+  crop: 4.0              # ↑ context (use 3.0 if VRAM tight)
+  mono: true
+
+  batch: 4
+  workers: 2
+  prefetch_factor: 2
+  cache_gb: 0.0
+  persistent_workers: true
+  pin_memory: true
+  no_cache: true
+
+  # Mixing / augmentation
+  min_clean_rms_db: -40.0
+  max_retries: 6
+  out_peak: 0.98
+
+  # Identity sampling
+
+  use_ext_noise_p: 0.05
+  add_synth_noise_p: 1.0
+  snr_min: 0.0
+  snr_max: 20.0
+  p_clean: 0.02
+
+  # new (match new DenoiseConfig fields)
+  synth_white_prob: 0.15
+  synth_pink_prob: 0.20
+  synth_brown_prob: 0.05
+  synth_band_prob: 0.30
+  synth_hum_prob: 0.15
+  synth_am_prob: 0.12
+  synth_click_prob: 0.03
+
+  band_min_hz: 20
+  band_max_hz: 16000
+
+  hum_base_hz: 50.0
+  hum_jitter_hz: 0.8
+  hum_harmonics: 6
+
+  am_rate_min_hz: 0.2
+  am_rate_max_hz: 2.0
+  am_depth_min: 0.3
+  am_depth_max: 0.7
+
+  click_rate_per_s: 1.5     # low density; just robustness
+  click_len_ms: 10.0
+  click_amp: 0.12
+
+  reject_impulsive_ext: true
+  impulsive_crest_thr: 14.0
+
+  # Sampler flag (actual params below in hard_mining)
+  hard_mining:
+    enable: true
+
+# -----------------------------
+# Model
+# -----------------------------
+model:
+  base: 64
+  mask_variant: plain      # complex mask (Re/Im)
+
+# -----------------------------
+# Training
+# -----------------------------
+train:
+  epochs: 150
+  ema: 0.993               # a bit lighter -> reacts faster
+  ema_device: cpu
+  ema_every: 4
+
+# -----------------------------
+# Optimizer / schedule
+# -----------------------------
+optim:
+  fused_ok: false
+  foreach_ok: true
+  grad_accum: 8        # with batch:4 -> eff 32 (match 48-run)
+  lr: 3.0e-4           # scale with eff batch; go 2e-4 if eff 16
+  warmup_steps: 300
+  wd: 1.0e-4
+  grad_clip: 3.0
+
+# -----------------------------
+# Runtime / performance
+# -----------------------------
+runtime:
+  amp: bfloat16
+  channels_last: true
+  cuda_prefetch: true
+  compile: false           # set true if torch.compile is stable for you
+
+# -----------------------------
+# STFT defaults (train + val)
+# -----------------------------
+inference_defaults:
+  n_fft: 1024
+  hop: 256
+
+# -----------------------------
+# Losses
+# -----------------------------
+loss:
+  lambda_nf: 0.00
+  mel_bands: 96            # richer mel guidance
+  hi_emph_khz: 8.0
+  sisdr_min_db: 0.0
+
+  # robustness in validation / plotting
+  train_loss_clip: 30.0
+  val_loss_clip: 25.0
+  val_trim_frac: 0.02
+
+  # mask behavior
+  lambda_idmask: 0.00
+  lambda_idwav: 0.00
+  sisdr_loss_cap: 1.0
+
+  mask_limit: 3.0
+  lambda_sisdr: 0.35
+  lambda_mel: 0.10
+  lambda_hi: 0.12
+  lambda_phase: 0.02
+  lambda_energy: 0.005
+
+# -----------------------------
+# Curriculum SNR (epoch-dependent)
+# -----------------------------
+
+curriculum:
+  enable: true
+  stages:
+    - until: 2   # easy
+      snr_min: 10
+      snr_max: 20
+    - until: 6   # normal
+      snr_min: 0
+      snr_max: 20
+    - until: 9999 # hard
+      snr_min: -10
+      snr_max: 20
+
+sisdr_curriculum:
+  enable: true
+  start_db: 0.0
+  end_db: 16.0
+  end_epoch: 20
+
+# -----------------------------
+# Hard-example mining (parameters)
+# -----------------------------
+hard_mining:
+  enable: true
+  ema: 0.9
+  baseline: 1.0
+  start_epoch: 3
+  top_frac: 0.30
+  boost: 4.0
