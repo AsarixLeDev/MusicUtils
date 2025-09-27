@@ -10,11 +10,10 @@ from __future__ import annotations
 import argparse
 import math
 import os
-import random
 import sys
 import inspect
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any
 
 # --- make 'soundrestorer' importable when running as: python scripts/train_denoiser.py
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
@@ -44,7 +43,7 @@ warnings.filterwarnings(
 from soundrestorer.models.denoiser_net import ComplexUNet
 from soundrestorer.losses.mrstft import MultiResSTFTLoss
 from soundrestorer.data.dataset import DenoiseDataset, DenoiseConfig
-from soundrestorer.train.config import load_and_prepare  # YAML + run dirs helper
+from todelete.train.config import load_and_prepare  # YAML + run dirs helper
 
 # =========== global switches ===========
 USE_CHANNELS_LAST = True  # ok for (B,2,F,T) tensors
@@ -931,7 +930,7 @@ def main():
 
     @torch.no_grad()
     def dataset_pairing_report(ds, n=128):
-        import numpy as np, random, torch
+        import random, torch
         ok_threshold_db = getattr(ds.cfg, "snr_db_min", 0.0)
         idxs = random.sample(range(len(ds)), k=min(n, len(ds)))
         vals = []

@@ -15,9 +15,9 @@ from soundrestorer.data.dataset import DenoiseDataset, DenoiseConfig
 # project imports
 from soundrestorer.losses.mrstft import MultiResSTFTLoss
 from soundrestorer.models.denoiser_net import ComplexUNet
-from soundrestorer.train.config import load_yaml, deep_update, parse_dotlist
-from soundrestorer.train.plotting import setup_matplotlib
-from soundrestorer.train.utils_stft import stft_pair, istft_from, hann_window
+from todelete.train.config import load_yaml, deep_update, parse_dotlist
+from todelete.train.plotting import setup_matplotlib
+from todelete.train.utils_stft import stft_pair, istft_from, hann_window
 
 torch.backends.cudnn.benchmark = True
 USE_CHANNELS_LAST = True

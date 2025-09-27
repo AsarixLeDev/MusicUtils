@@ -1,0 +1,85 @@
+paths:
+  runs_root: soundrestorer/runs
+  run_name: den_flex
+
+# -------- data ----------
+data:
+  train_manifest: soundrestorer/data/training/train.jsonl
+  val_manifest:   soundrestorer/data/training/val.jsonl
+  sr: 48000
+  crop: 3.0
+  mono: true
+  batch: 8
+  workers: 2
+  prefetch_factor: 2
+  cache_gb: 0.0
+  persistent_workers: true
+  pin_memory: true
+  no_cache: true
+
+  # mixing
+  snr_min: 0.0
+  snr_max: 20.0
+  use_ext_noise_p: 0.5
+  min_clean_rms_db: -40.0
+  max_retries: 6
+  out_peak: 0.98
+
+  p_clean: 0.10
+  add_synth_noise_p: 0.7
+
+  hard_mining:
+    enable: true
+
+# -------- model ----------
+model:
+  name: complex_unet
+  args:
+    base: 48
+    # mask head defined in the Task via mask_variant/mask_limit
+
+# -------- task (denoise via STFT mask) ----------
+task:
+  name: denoise_stft
+  args:
+    n_fft: 1024
+    hop: 256
+    mask_variant: plain   # plain | delta1 | mag | mag_sigm1 | mag_delta1
+    mask_limit: 2.5
+
+# -------- losses (automated compose) ----------
+losses:
+  items:
+    - {name: mrstft,      weight: 1.0}
+    - {name: l1_wave,     weight: 0.5}
+    - {name: sisdr_ratio, weight: 0.30, args: {min_db: 10.0}}
+    - {name: mel_l1,      weight: 0.10, args: {sr: 48000, n_mels: 64, n_fft: 1024, hop: 256}}
+    - {name: highband_l1, weight: 0.10, args: {sr: 48000, cutoff_khz: 8.0, n_fft: 1024, hop: 256}}
+    - {name: phase_cosine,weight: 0.02, args: {n_fft: 1024, hop: 256}}
+    - {name: energy_anchor, weight: 0.005}
+
+# -------- train / optim ----------
+train:
+  epochs: 150
+  save_every: 1
+  ema: 0.995
+
+optim:
+  lr: 3.0e-4
+  warmup_steps: 300
+  wd: 1.0e-4
+  grad_clip: 3.0
+  grad_accum: 1
+
+runtime:
+  amp: bfloat16
+  channels_last: true
+  cuda_prefetch: true
+  compile: false
+
+hard_mining:
+  start_epoch: 3
+  ema: 0.9
+  top_frac: 0.30
+  boost: 4.0
+  baseline: 1.0

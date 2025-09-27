@@ -1,0 +1,157 @@
+paths:
+  runs_root: soundrestorer/runs
+  run_name: den_flex
+
+data:
+  train_manifest: soundrestorer/data/training/train.jsonl
+  val_manifest:   soundrestorer/data/training/val.jsonl
+  sr: 48000
+  crop: 3.0
+  mono: true
+  batch: 8
+  workers: 2
+  prefetch_factor: 2
+  persistent_workers: true
+  pin_memory: true
+  cache_gb: 2.0
+  no_cache: false
+
+  # mixing (dataset-side if your dataset supports it)
+  snr_min: 0.0
+  snr_max: 20.0
+  use_ext_noise_p: 0.5
+  min_clean_rms_db: -40.0
+  max_retries: 6
+  out_peak: 0.98
+
+  p_clean: 0.10
+  add_synth_noise_p: 0.7      # leave as-is; we also add proc_noise callback augment
+
+  hard_mining:
+    enable: true
+
+model:
+  name: complex_unet_auto
+  args:
+    base: 48
+    prefer_temporal: true
+    min_free_mem_mb: 3500
+    lstm_hidden: 128
+    lstm_layers: 2
+    bidirectional: true
+
+task:
+  name: denoise_stft
+  args:
+    n_fft: 1024
+    hop: 256
+    mask_variant: plain
+    mask_limit: 2.0
+
+losses:
+  items:
+    - {name: mrstft,      weight: 1.0}
+    - {name: l1_wave,     weight: 0.5}
+    - {name: sisdr_ratio, weight: 0.30, args: {min_db: 8.0}}
+    - {name: mel_l1,      weight: 0.10, args: {sr: 48000, n_mels: 64, n_fft: 1024, hop: 256}}
+    - {name: highband_l1, weight: 0.10, args: {sr: 48000, cutoff_khz: 8.0, n_fft: 1024, hop: 256}}
+    - {name: phase_cosine,weight: 0.02, args: {n_fft: 1024, hop: 256}}
+    - {name: energy_anchor, weight: 0.005}
+
+loss:
+  train_loss_clip: 2.0      # was 30.0
+  train_trim_frac: 0.05 # robust train mean
+  lambda_sisdr: 0.30     # keep strong
+  sisdr_loss_cap: 1.0
+  lambda_mel: 0.15       # a bit stronger than 0.10
+  lambda_hi: 0.10        # okay
+  lambda_phase: 0.02
+  lambda_energy: 0.010   # slightly higher to curb over-boost
+  mask_limit: 1.5
+
+train:
+  epochs: 150
+  save_every: 1
+  ema: 0.995
+
+optim:
+  lr: 3.0e-4
+  warmup_steps: 300
+  wd: 1.0e-4
+  grad_clip: 3.0
+  grad_accum: 1
+
+runtime:
+  amp: bfloat16
+  channels_last: true
+  cuda_prefetch: true
+  compile: false
+
+hard_mining:
+  enable: true
+  start_epoch: 3
+  ema: 0.9
+  top_frac: 0.20
+  boost: 2.0
+  baseline: 1.0
+  reset_every: 10   # (add support) reset stats every 10 epochs to refresh coverage
+
+callbacks:
+  epoch_seed:
+    enable: true
+
+  proc_noise:
+    enable: true
+    prob: 0.50
+    snr_min: 0.0
+    snr_max: 20.0
+    noise_cfg:
+      weights: {white: 1.0, pink: 1.0, brown: 0.6, band: 1.0, hum: 0.5, clicks: 0.3}
+      band_lo: 100
+      band_hi: 12000
+      band_min_bw: 200
+
+  curriculum:
+    stages:
+      - until: 2
+        snr_min: 14
+        snr_max: 20
+        use_ext_noise_p: 0.5
+        mask_limit: 1.25
+      - until: 8
+        snr_min: 4
+        snr_max: 20
+        use_ext_noise_p: 0.7
+        mask_limit: 1.5
+      - until: 9999
+        snr_min: -3
+        snr_max: 20
+        use_ext_noise_p: 0.8
+        mask_limit: 2.0
+    sisdr_curriculum:
+      enable: true
+      start_db: 0.0
+      end_db: 14.0
+      end_epoch: 20
+    mask_limit:
+      start: 1.5
+      end:   2.5
+      end_epoch: 24
+
+  audio_debug:
+    enable: true
+    every: 5
+    num_items: 3
+
+  best_ckpt:
+    enable: true
+    top_k: 3
+    monitor: val_loss
+    mode: min
+
+  early_stop:
+    enable: false       # turn true if you're running sweeps
+    patience: 20
+    min_delta: 0.0
+    monitor: val_loss
+    mode: min

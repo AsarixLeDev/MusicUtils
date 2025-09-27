@@ -9,7 +9,7 @@ import soundfile as sf
 import torch
 
 from soundrestorer.models.denoiser_net import ComplexUNet
-from soundrestorer.train.utils_stft import stft_pair, istft_from, hann_window
+from todelete.train.utils_stft import stft_pair, istft_from, hann_window
 
 torch.backends.cudnn.benchmark = True
 
