@@ -1,55 +1,71 @@
-# soundrestorer/core/prefetch.py
 from __future__ import annotations
 import torch
 
 class CUDAPrefetcher:
+    """
+    Overlaps H2D copies with compute. Works with list/tuple batches.
+    - Moves tensors to device with non_blocking=True
+    - Keeps meta dicts on CPU
+    - Optionally sets channels_last on 4D tensors (B,2,F,T)
+    """
     def __init__(self, loader, device: str = "cuda", channels_last: bool = True):
         self.loader = iter(loader)
         self.device = device
-        self.channels_last = channels_last
+        self.channels_last = bool(channels_last)
         self.stream = torch.cuda.Stream() if device.startswith("cuda") else None
-        self.next = None
+        self._next = None
         self._preload()
 
     def _to(self, t):
-        if t is None: return None
+        if t is None:
+            return None
         if isinstance(t, torch.Tensor):
             return t.to(self.device, non_blocking=True)
-        return torch.as_tensor(t).to(self.device, non_blocking=True)
+        # non-tensor → leave as is (e.g., meta dicts)
+        return t
+
+    def _format(self, t):
+        if not self.channels_last:
+            return t
+        if isinstance(t, torch.Tensor) and t.dim() == 4:
+            return t.contiguous(memory_format=torch.channels_last)
+        return t
 
     def _preload(self):
         try:
             batch = next(self.loader)
         except StopIteration:
-            self.next = None
+            self._next = None
             return
+
         if self.stream is None:
-            self.next = batch
+            # CPU-only or no CUDA: just keep as-is
+            self._next = batch
             return
+
         with torch.cuda.stream(self.stream):
             if isinstance(batch, (list, tuple)):
                 moved = []
                 for x in batch:
                     if isinstance(x, dict):
-                        moved.append(x)      # meta stays on CPU
+                        moved.append(x)
+                    elif isinstance(x, (list, tuple)):
+                        moved.append(type(x)(self._to(xx) for xx in x))
                     else:
                         moved.append(self._to(x))
-                self.next = tuple(moved)
+                self._next = type(batch)(moved) if isinstance(batch, tuple) else moved
             else:
-                self.next = self._to(batch)
+                self._next = self._to(batch)
 
-    def next_batch(self):
+            # format after copy
+            if isinstance(self._next, (list, tuple)):
+                self._next = type(self._next)(self._format(x) for x in self._next)
+            else:
+                self._next = self._format(self._next)
+
+    def next(self):
         if self.stream is not None:
             torch.cuda.current_stream().wait_stream(self.stream)
-        out = self.next
-        if out is not None and self.channels_last:
-            # best effort: put 4D tensors in channels_last (B,2,F,T)
-            def _fmt(u):
-                return u.contiguous(memory_format=torch.channels_last) if (
-                    isinstance(u, torch.Tensor) and u.dim() == 4) else u
-            if isinstance(out, (list, tuple)):
-                out = tuple(_fmt(u) for u in out)
-            else:
-                out = _fmt(out)
+        out = self._next
         self._preload()
         return out

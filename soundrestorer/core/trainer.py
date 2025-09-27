@@ -2,6 +2,8 @@ from __future__ import annotations
 import math, torch, time
 from typing import Dict, Any, List, Optional, Tuple, Iterable
 from torch import nn
+
+from .batch_guard import BatchGuard
 from .registry import CALLBACKS
 from tqdm import tqdm
 import time
@@ -59,7 +61,6 @@ class Trainer:
         task,                 # implements: step(model, batch) -> (outputs, per_sample_proxy)
         loss_fn,              # ComposedLoss-like: returns (scalar, dict of components)
         optimizer,
-        runtime,
         scheduler=None,
         device="cuda",
         amp="float32",       # "bfloat16" | "float16" | "float32"
@@ -77,7 +78,7 @@ class Trainer:
         self.opt = optimizer
         self.sched = scheduler
         self.device = device
-        self.runtime = runtime
+        self.runtime = getattr(self, "runtime", {})  # or pass it in the constructor
         self.amp = str(amp).lower()
         self.grad_accum = max(1,int(grad_accum))
         self.grad_clip = float(grad_clip)
@@ -113,113 +114,156 @@ class Trainer:
         if hasattr(self.sched, "step"): self.sched.step()
 
     def fit(self, train_loader, val_loader, epochs: int, ckpt_saver=None):
+        """
+        Drop-in training loop with:
+          - tqdm progress bars for train/val
+          - per-batch LR display
+          - robust trimmed-mean for train loss (ignores outlier spikes)
+          - per-epoch component loss averages
+          - batch skipping when loss explodes (configurable)
+          - full callback support
+        Tuning knobs (set once after constructing Trainer, if you like):
+          self.train_loss_clip  (float, default 2.0)
+          self.train_trim_frac  (float, default 0.05)
+        """
+
+        # --- small helpers ---
+        def _trimmed_mean(vals, trim_frac=0.05):
+            if not vals: return 0.0
+            vs = sorted(vals);
+            k = int(len(vs) * trim_frac)
+            core = vs[k: len(vs) - k] if len(vs) - 2 * k > 0 else vs
+            return sum(core) / max(1, len(core))
+
+        clip_thr = float(getattr(self, "train_loss_clip", 2.0))
+        trim_frac = float(getattr(self, "train_trim_frac", 0.05))
         st = self.state
-        robust = RobustAverager(trim_frac=self.loss_cfg.get("train_trim_frac", 0.05))
-        clip_thr = float(self.loss_cfg.get("train_loss_clip", 2.0))  # tighten a lot
-        for cb in self.callbacks: cb.on_train_start(trainer=self, state=st)
+
+        for cb in self.callbacks:
+            cb.on_train_start(trainer=self, state=st)
+
+        guard_cfg = getattr(self, "guard_cfg", {}) or {}
+        guard = BatchGuard(**{
+            "hard_clip": float(guard_cfg.get("hard_clip", 2.0)),
+            "window": int(guard_cfg.get("window", 512)),
+            "mad_k": float(guard_cfg.get("mad_k", 6.0)),
+            "snr_floor_db": float(guard_cfg.get("snr_floor_db", -3.0)),
+            "min_rms_db": float(guard_cfg.get("min_rms_db", -70.0)),
+            "max_peak": float(guard_cfg.get("max_peak", 1.2)),
+        })
 
         for epoch in range(st.epoch, epochs + 1):
             st.epoch = epoch
-            for cb in self.callbacks: cb.on_epoch_start(trainer=self, state=st)
+            for cb in self.callbacks:
+                cb.on_epoch_start(trainer=self, state=st)
 
+            # -------------------- TRAIN --------------------
             self.model.train()
-            running = 0.0
-            used = 0
-            skipped = 0
-            step_in_epoch = 0
-            comp_sums_tr = {}  # name -> sum over batches
+            t0 = time.time()
+            used = skipped = 0
+            sum_loss = 0.0
+            train_losses = []
+            comp_sums_tr = {}  # name -> sum
             comp_count_tr = 0
 
-            t0 = time.time()
+            pbar_tr = tqdm(total=len(train_loader), desc=f"train {epoch:03d}", leave=False, dynamic_ncols=True)
 
-            use_prefetch = self.device.startswith("cuda") and self.runtime.get("cuda_prefetch", True)
+            use_prefetch = getattr(self, "runtime", {}).get("cuda_prefetch", True) and self.device.startswith("cuda")
             if use_prefetch:
-                from soundrestorer.core.prefetch import CUDAPrefetcher
-                prefetch = CUDAPrefetcher(train_loader, device=self.device, channels_last=self.channels_last)
-                get_batch = prefetch.next_batch
+                try:
+                    from soundrestorer.core.prefetch import CUDAPrefetcher
+                    prefetch = CUDAPrefetcher(train_loader, device=self.device, channels_last=self.channels_last)
+                    get_batch = prefetch.next
+                except Exception as e:
+                    print(f"[prefetch] disabled: {e}")
+                    it = iter(train_loader)
+                    get_batch = lambda: next(it, None)
             else:
                 it = iter(train_loader)
                 get_batch = lambda: next(it, None)
-
             batch = get_batch()
-
-            # ----- TRAIN PROGRESS BAR -----
-            pbar_tr = tqdm(total=len(train_loader), desc=f"train {epoch:03d}", leave=False, dynamic_ncols=True)
-
             while batch is not None:
-                # callbacks can augment batch (e.g., procedural noise)
+                # callbacks may augment/mutate batch in-place (e.g., procedural noise)
                 for cb in self.callbacks:
                     cb.on_batch_start(trainer=self, state=st, batch=batch)
 
-                step_in_epoch += 1
+                # forward + loss (AMP autocast outside; model dtype governs math)
                 with torch.autocast(device_type=("cuda" if self.device.startswith("cuda") else "cpu"),
                                     dtype=self.autocast_dtype, enabled=self.use_autocast):
                     outputs, per_sample = self.task.step(self.model, batch)
                     loss, comps = self.loss_fn(outputs, batch)
 
-                val = float(loss.detach().item())
-                if not math.isfinite(val) or (clip_thr > 0 and val > clip_thr):
+                s = float(loss.detach().item())
+                # use the guard
+                skip, why = guard.should_skip(batch=batch, outputs=outputs, loss_value=s)
+                if skip:
                     skipped += 1
+                    # if why:
+                    #     print(f"[guard] skip step {st.global_step} (epoch {epoch}) — {why}")
+                    pbar_tr.update(1)
+                    # DO NOT step optimizer/scheduler; fetch next batch
                     batch = get_batch()
                     continue
 
-                robust.add(val)
-                tot += val
-                used += 1
-
+                # backward / step (with grad accumulation + scaler)
                 if self.scaler.is_enabled():
                     self.scaler.scale(loss / self.grad_accum).backward()
                     if (st.global_step + 1) % self.grad_accum == 0:
                         self.scaler.unscale_(self.opt)
                         if self.grad_clip > 0:
                             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                        self.scaler.step(self.opt)
-                        self.scaler.update()
+                        self.scaler.step(self.opt);
+                        self.scaler.update();
                         self._zero()
                 else:
                     (loss / self.grad_accum).backward()
                     if (st.global_step + 1) % self.grad_accum == 0:
                         if self.grad_clip > 0:
                             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                        self.opt.step()
+                        self.opt.step();
                         self._zero()
 
+                # scheduler & bookkeeping
                 self._step_sched()
                 st.global_step += 1
                 used += 1
-                running += s
+                sum_loss += s
+                train_losses.append(s)
 
-                # aggregate component means (by batch)
+                # aggregate component losses (mean over batches)
                 if isinstance(comps, dict):
                     for k, v in comps.items():
                         comp_sums_tr[k] = comp_sums_tr.get(k, 0.0) + float(v)
                     comp_count_tr += 1
 
-                # per-batch callback
+                # per-batch callbacks
                 for cb in self.callbacks:
                     cb.on_batch_end(trainer=self, state=st, loss=s, comps=comps, outputs=outputs,
                                     per_sample=per_sample, batch=batch)
 
                 # live bar status
                 lr_now = self.opt.param_groups[0]['lr']
-                pbar_tr.set_postfix(loss=f"{s:.4f}", avg=f"{(running / max(1, used)):.4f}", lr=f"{lr_now:.2e}")
+                avg_now = (sum_loss / max(1, used))
+                rob_now = _trimmed_mean(train_losses, trim_frac=trim_frac)
+                pbar_tr.set_postfix(loss=f"{s:.4f}", avg=f"{avg_now:.4f}", rob=f"{rob_now:.4f}", lr=f"{lr_now:.2e}")
                 pbar_tr.update(1)
                 batch = get_batch()
 
-
             pbar_tr.close()
-            avg_tr = running / max(1, used)
+            avg_tr = (sum_loss / max(1, used))
+            avg_tr_rob = _trimmed_mean(train_losses, trim_frac=trim_frac)
             comps_mean_tr = {k: (comp_sums_tr[k] / max(1, comp_count_tr)) for k in sorted(comp_sums_tr.keys())}
             epoch_time = time.time() - t0
 
-            # ---------- VALIDATION ----------
+            # -------------------- VALID --------------------
             self.model.eval()
-            tot_v = 0.0
+            tot_v = 0.0;
             used_v = 0
-            comp_sums_v = {}
+            comp_sums_v = {};
             comp_count_v = 0
 
-            for cb in self.callbacks: cb.on_val_start(trainer=self, state=st)
+            for cb in self.callbacks:
+                cb.on_val_start(trainer=self, state=st)
 
             pbar_va = tqdm(total=len(val_loader), desc=f"valid {epoch:03d}", leave=False, dynamic_ncols=True)
             with torch.no_grad(), torch.autocast(device_type=("cuda" if self.device.startswith("cuda") else "cpu"),
@@ -231,7 +275,7 @@ class Trainer:
                     if not math.isfinite(sv):
                         pbar_va.update(1)
                         continue
-                    tot_v += sv
+                    tot_v += sv;
                     used_v += 1
                     if isinstance(comps_v, dict):
                         for k, v in comps_v.items():
@@ -246,23 +290,29 @@ class Trainer:
 
             # callbacks can log/save using detailed stats
             for cb in self.callbacks:
-                cb.on_val_end(trainer=self, state=st, train_loss=avg_tr, val_loss=avg_v,
+                cb.on_val_end(trainer=self, state=st, train_loss=avg_tr_rob, val_loss=avg_v,
                               train_comps=comps_mean_tr, val_comps=comps_mean_v,
                               train_used=used, train_skipped=skipped, epoch_time=epoch_time)
 
             if ckpt_saver:
                 ckpt_saver(self.model, self.opt, self.sched, st)
 
-            # final epoch line (also available via ConsoleLogger)
+            # one-line epoch summary
             lr_now = self.opt.param_groups[0]['lr']
             comps_str = " ".join(f"{k}={v:.4f}" for k, v in comps_mean_tr.items())
-            print(f"[epoch {epoch:03d}] train {avg_tr:.4f} | val {avg_v:.4f} | used {used} "
-                  f"| skip {skipped} | lr {lr_now:.2e} | {epoch_time:.1f}s | {comps_str}")
+            print(f"[epoch {epoch:03d}] train {avg_tr:.4f} (rob {avg_tr_rob:.4f}) | val {avg_v:.4f} "
+                  f"| used {used} | skip {skipped} | lr {lr_now:.2e} | {epoch_time:.1f}s | {comps_str}")
 
             for cb in self.callbacks:
-                cb.on_epoch_end(trainer=self, state=st, train_loss=avg_tr, val_loss=avg_v,
+                cb.on_epoch_end(trainer=self, state=st, train_loss=avg_tr_rob, val_loss=avg_v,
                                 train_comps=comps_mean_tr, val_comps=comps_mean_v,
                                 train_used=used, train_skipped=skipped, epoch_time=epoch_time)
 
-        for cb in self.callbacks: cb.on_train_end(trainer=self, state=st)
+            # early stop if any callback requests it
+            if any(getattr(cb, "should_stop", False) for cb in self.callbacks):
+                print("[trainer] early stop requested by callback.")
+                break
+
+        for cb in self.callbacks:
+            cb.on_train_end(trainer=self, state=st)
 

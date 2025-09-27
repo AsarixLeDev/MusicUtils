@@ -164,8 +164,11 @@ def main():
         model=model, task=task, loss_fn=loss_fn, optimizer=opt, scheduler=sched,
         device=device, amp=amp, grad_accum=int(opt_cfg.get("grad_accum", 1)),
         grad_clip=float(opt_cfg.get("grad_clip", 0.0)), channels_last=ch_last,
-        compile_model=compile_ok, callbacks=cbs, runtime=cfg["runtime"]
+        compile_model=compile_ok, callbacks=cbs
     )
+    # expose runtime + guard_cfg to the trainer (if your __init__ doesn’t accept them)
+    trainer.runtime = cfg.get("runtime", {})
+    trainer.guard_cfg = cfg.get("guard", {})
 
     # ---- GO ----
     trainer.fit(tr_ld, va_ld, epochs=int(cfg["train"]["epochs"]), ckpt_saver=None)
