@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, torch, os
+import argparse, torch, os, inspect
 
 from soundrestorer.core.config import load_yaml, apply_overrides, prepare_run_dirs
 from soundrestorer.core.registry import MODELS
@@ -8,9 +8,10 @@ from soundrestorer.core.trainer import Trainer, WarmupCosine
 from soundrestorer.core.callbacks import (
     EMACallback, CheckpointCallback, ConsoleLogger, HardMiningCallback,
     ProcNoiseAugmentCallback, CurriculumCallback, AudioDebugCallback,
-    BestCheckpointCallback, EarlyStoppingCallback, EpochSeedCallback
+    BestCheckpointCallback, EarlyStoppingCallback, EpochSeedCallback, EmaEvalSwap, EmaUpdateCallback
 )
 from soundrestorer.core.plugins import autoload_packages
+from soundrestorer.ema.ema import EMA
 from soundrestorer.losses.composed import ComposedLoss
 from soundrestorer.data.builder import build_denoise_loader
 from soundrestorer.core.loader import default_loader_args
@@ -20,6 +21,37 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 try: torch.set_float32_matmul_precision("high")
 except: pass
+
+try:
+    import torch._inductor.config as _inductor_cfg
+    _inductor_cfg.max_autotune_gemm = False
+except Exception:
+    pass
+
+# --- compile helper: try inductor, fallback to aot_eager, else off ---
+def maybe_compile_model(model, runtime_cfg):
+    want_compile = bool(runtime_cfg.get("compile", False))
+    backend = str(runtime_cfg.get("compile_backend", "inductor")).lower()
+    mode    = str(runtime_cfg.get("compile_mode", "default")).lower()
+
+    if not want_compile or not hasattr(torch, "compile"):
+        return model, False, "off"
+
+    # Inductor needs Triton; check it first
+    if backend == "inductor":
+        try:
+            import triton  # noqa: F401
+        except Exception:
+            print("[compile] Triton not available; falling back to backend='aot_eager'")
+            backend = "aot_eager"
+
+    try:
+        m = torch.compile(model, backend=backend, mode=mode)
+        print(f"[compile] torch.compile active ({backend}, {mode})")
+        return m, True, f"{backend}/{mode}"
+    except Exception as e:
+        print(f"[compile] disabled ({backend}, {mode}): {e}")
+        return model, False, "off"
 
 def parse_args():
     ap = argparse.ArgumentParser("Generic Trainer")
@@ -68,8 +100,10 @@ def main():
     tr_ld = torch.utils.data.DataLoader(tr_ds, **tr_args)
     va_ld = torch.utils.data.DataLoader(va_ds, **va_args)
 
+
     # ---- MODEL ----
     model = MODELS.build(cfg["model"]["name"], **cfg["model"].get("args", {})).float().to(device)
+    model, compiled, compiled_desc = maybe_compile_model(model, cfg.get("runtime", {}))
 
     from soundrestorer.models.init_utils import init_head_for_mask
     task_mask = cfg.get("task", {}).get("args", {}).get("mask_variant", "plain")
@@ -84,11 +118,23 @@ def main():
 
     # ---- OPT / SCHED ----
     opt_cfg = cfg["optim"]
-    opt = torch.optim.AdamW(model.parameters(),
-                            lr=float(opt_cfg["lr"]),
-                            betas=(0.9, 0.95),
-                            eps=1e-8,
-                            weight_decay=float(opt_cfg.get("wd", 0.0)))
+    lr = float(opt_cfg["lr"]);
+    wd = float(opt_cfg.get("wd", 1e-4))
+
+    sig = inspect.signature(torch.optim.AdamW.__init__).parameters
+    use_fused = ("fused" in sig) and torch.cuda.is_available()
+    use_foreach = ("foreach" in sig)
+
+    kwargs = dict(lr=lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=wd)
+    if use_fused:
+        opt = torch.optim.AdamW(model.parameters(), fused=True, **kwargs)
+        print("[optim] AdamW fused=True")
+    elif use_foreach:
+        opt = torch.optim.AdamW(model.parameters(), foreach=True, **kwargs)
+        print("[optim] AdamW foreach=True")
+    else:
+        opt = torch.optim.AdamW(model.parameters(), **kwargs)
+        print("[optim] AdamW plain")
     total_steps = int(cfg["train"]["epochs"]) * max(1, len(tr_ld))
     min_factor = float(cfg["optim"].get("lr_min_factor", 0.3))
     sched = WarmupCosine(opt, total_steps=total_steps,
@@ -96,9 +142,12 @@ def main():
                          min_factor=min_factor)
 
     # ---- CALLBACKS ----
+    ema_decay = float(cfg.get("train", {}).get("ema", 0.995))
+    ema_helper = EMA(model, decay=ema_decay)
     cbs = [ConsoleLogger()]
     if float(cfg["train"].get("ema", 0.0)) > 0:
-        cbs.append(EMACallback(model, decay=float(cfg["train"]["ema"])))
+        cbs.append(EmaUpdateCallback(ema_helper))  # keep EMA updated during training
+        cbs.append(EmaEvalSwap(ema_obj=ema_helper, enable=True))
     if cfg["data"].get("hard_mining", {}).get("enable", False):
         hm = cfg.get("hard_mining", {})
         cbs.append(HardMiningCallback(
@@ -175,15 +224,18 @@ def main():
     trainer = Trainer(
         model=model, task=task, loss_fn=loss_fn, optimizer=opt, scheduler=sched,
         device=device, amp=amp, grad_accum=int(opt_cfg.get("grad_accum", 1)),
-        grad_clip=float(opt_cfg.get("grad_clip", 0.0)), channels_last=ch_last,
-        compile_model=compile_ok, callbacks=cbs
+        grad_clip=float(opt_cfg.get("grad_clip", 0.0)), channels_last=ch_last, callbacks=cbs
     )
     # make sure runtime + guard knobs are visible to trainer.fit()
     trainer.runtime = cfg.get("runtime", {})
+    trainer.runtime["compile_desc"] = compiled_desc
+    # (if you want a boolean too)
+    trainer.compiled = compiled
     trainer.guard_cfg = cfg.get("guard", {})
     trainer.debug_cfg = cfg.get("debug", {})  # <— NEW
-    trainer.train_loss_clip = cfg.get("loss", {}).get("train_loss_clip", 0.0)
     trainer.train_trim_frac = cfg.get("loss", {}).get("train_trim_frac", 0.10)
+    trainer.train_loss_clip = cfg.get("loss", {}).get("train_loss_clip", 0.0)
+    trainer.val_trim_frac = cfg.get("loss", {}).get("val_trim_frac", 0.05)
 
     # ---- GO ----
     trainer.fit(tr_ld, va_ld, epochs=int(cfg["train"]["epochs"]), ckpt_saver=None)

@@ -11,9 +11,7 @@ class L1Wave(LossModule):
 @LOSSES.register("sisdr_ratio")
 class SISDRRatio(LossModule):
     def __init__(self, min_db=0.0, cap=1.0):
-        self.min_db = float(min_db)
-        self.cap = float(cap)
-
+        self.min_db = float(min_db); self.cap = float(cap)
     def forward(self, outputs, batch):
         eps = 1e-8
         y = outputs["yhat"]; x = outputs["clean"].float()
@@ -25,11 +23,9 @@ class SISDRRatio(LossModule):
         e = yz - s
         si_sdr = 10 * torch.log10(torch.sum(s**2, dim=-1) /
                                   (torch.sum(e**2, dim=-1) + eps) + eps)
-        denom = max(abs(self.min_db), 1e-6)
-        loss = torch.clamp((self.min_db - si_sdr) / denom, min=0.0)
-        if self.cap > 0:
-            loss = torch.clamp(loss, max=self.cap)
-        return torch.mean(loss)
+        loss = torch.clamp((self.min_db - si_sdr) / max(abs(self.min_db), 1e-6), min=0.0)
+        if self.cap > 0: loss = torch.clamp(loss, max=self.cap)
+        return loss.mean()
 
 @LOSSES.register("mel_l1")
 class MelL1(LossModule):

@@ -166,6 +166,14 @@ class CurriculumCallback(Callback):
             if ok:
                 print(f"[curriculum] epoch {e}: SISDR min_db -> {target:.2f} dB")
 
+        # after SISDR target
+        if hasattr(self.loss_fn, "items"):
+            # find sisdr_ratio and bump its weight after a few epochs
+            if state.epoch >= 3:
+                for i, (name, w, fn) in enumerate(self.loss_fn.items):
+                    if name == "sisdr_ratio":
+                        self.loss_fn.items[i] = (name, 0.40, fn)  # from 0.30 -> 0.40
+
         # mask_limit schedule on task
         if self.mask_limit:
             m0 = float(self.mask_limit.get("start", 1.5))
@@ -179,16 +187,16 @@ class CurriculumCallback(Callback):
 
         for st in self.mask_variant:
             if e <= int(st.get("until", 10 ** 9)):
-                v = str(st.get("variant", "")).lower()
-                if v and hasattr(self.task, "mask_variant"):
-                    self.task.mask_variant = v
-                    # Re-bias head to identity for the new variant
-                    try:
-                        from soundrestorer.models.init_utils import init_head_for_mask
-                        init_head_for_mask(trainer.model, v)
-                    except Exception:
-                        pass
-                break
+                if hasattr(self, "mask_variant") and self.mask_variant:
+                    for stg in self.mask_variant:
+                        until = int(stg.get("until", 10 ** 9))
+                        if state.epoch <= until:
+                            v = str(stg.get("variant", "")).lower()
+                            if v and hasattr(self.task, "mask_variant"):
+                                self.task.mask_variant = v
+                                print(f"[curriculum] epoch {state.epoch}: mask_variant -> {v}")
+                            break
+
 
 
 class AudioDebugCallback(Callback):
@@ -322,5 +330,64 @@ class EpochSeedCallback(Callback):
         random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
         for ds in self.datasets:
             if hasattr(ds, "set_epoch"): ds.set_epoch(state.epoch)
+
+
+class EmaUpdateCallback(Callback):
+    """Keeps EMA weights up-to-date during training."""
+    def __init__(self, ema):
+        self.ema = ema
+
+    @torch.no_grad()
+    def on_batch_end(self, trainer=None, **_):
+        self.ema.update(trainer.model)
+
+class EmaEvalSwap(Callback):
+    """
+    Swap live model weights with EMA for validation, then restore.
+    The actual load_state_dict copies are done under `torch.inference_mode()`
+    so that in-place writes to inference-tagged storages (e.g., LSTM params)
+    are allowed. We do NOT keep inference_mode active for anything else.
+    """
+    def __init__(self, ema_obj, enable: bool = True):
+        self.ema = ema_obj
+        self.enable = bool(enable)
+        self._backup = None
+        self._was_training = None
+
+    @torch.no_grad()
+    def on_val_start(self, trainer=None, state=None, **_):
+        if not self.enable or self.ema is None:
+            return
+        self._was_training = trainer.model.training
+
+        # CPU backup to avoid device / view / inference flag issues
+        self._backup = {
+            k: v.detach().cpu().clone()
+            for k, v in trainer.model.state_dict().items()
+        }
+
+        # Load EMA weights under inference_mode to permit in-place writes
+        dev = next(trainer.model.parameters()).device
+        ema_sd = {k: v.detach().to(dev) for k, v in self.ema.state_dict().items()}
+        with torch.inference_mode():
+            trainer.model.load_state_dict(ema_sd, strict=False)
+        trainer.model.eval()
+
+    @torch.no_grad()
+    def on_val_end(self, trainer=None, state=None, **_):
+        if self._backup is None:
+            return
+        dev = next(trainer.model.parameters()).device
+
+        # Restore original weights under inference_mode (allow in-place writes)
+        orig_sd = {k: v.to(dev) for k, v in self._backup.items()}
+        with torch.inference_mode():
+            trainer.model.load_state_dict(orig_sd, strict=False)
+
+        # Restore train/eval mode
+        trainer.model.train(self._was_training is True)
+
+        self._backup = None
+        self._was_training = None
 
 

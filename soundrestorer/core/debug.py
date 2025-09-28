@@ -26,6 +26,20 @@ def si_sdr_db(y: torch.Tensor, x: torch.Tensor, eps: float = 1e-8) -> torch.Tens
     den = torch.sum(e ** 2, dim=-1) + eps
     return 10.0 * torch.log10(num / den + eps)  # (B,)
 
+def fmt_compact_comps(d: dict, order=("mrstft","mel_l1","l1_wave","phase_cosine","highband_l1","sisdr_ratio","energy_anchor")):
+    parts = []
+    for k in order:
+        if k in d:
+            parts.append(f"{k.replace('_','')}={d[k]:.3f}")
+    return " ".join(parts)
+
+def fmt_skip_reasons(skip_reasons: dict, top=4):
+    if not skip_reasons:
+        return ""
+    it = sorted(skip_reasons.items(), key=lambda kv: kv[1], reverse=True)[:top]
+    return " | skips: " + ", ".join(f"{k} ×{v}" for k,v in it)
+
+
 def short_device_summary(model: torch.nn.Module, runtime: Dict[str, Any]) -> str:
     p = next(model.parameters())
     dev = str(p.device)

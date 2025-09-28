@@ -10,17 +10,24 @@ class DenoiseSTFTTask:
     Turns (noisy, clean) -> model input (RI), applies mask mapping,
     reconstructs time-domain yhat. Returns outputs dict + per-sample proxy (L1).
     """
-    def __init__(self, n_fft=1024, hop=256, mask_variant="plain", mask_limit=0.0, device="cuda"):
+    def __init__(self, n_fft=1024, hop=256, mask_variant="plain", mask_limit=0.0,
+                 clamp_mask_tanh: float = 0.0,  # NEW: 0 disables; else tanh clamp +/-clamp
+                 safe_unity_fallback: bool = True,  # NEW
+                 device="cuda"):
         self.n_fft=int(n_fft); self.hop=int(hop)
         self.mask_variant=str(mask_variant).lower()
         self.mask_limit=float(mask_limit)
+        self.clamp_mask = float(clamp_mask_tanh)
+        self.safe_unity = bool(safe_unity_fallback)
         self.device=device
         self._win = None
 
     def _win_on(self, device):
         if (self._win is None) or (self._win.device != device):
+            from soundrestorer.utils.audio import hann_window
             self._win = hann_window(self.n_fft, device)
-        return self._win
+        # ensure normal (non-inference) tensor
+        return self._win.clone().detach()
 
     def _map_mask(self, Mr: torch.Tensor, Mi: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.mask_variant == "mag_sigm1":
@@ -61,12 +68,23 @@ class DenoiseSTFTTask:
         Xn, Xn_ri = stft_pair(noisy, win, self.n_fft, self.hop)  # float32
         if Xn_ri.dtype != p_dtype:
             Xn_ri = Xn_ri.to(p_dtype)
-        M = model(Xn_ri)
+        M = model(Xn_ri)  # (B,2,F,T)
         Mr, Mi = M[:, 0].float(), M[:, 1].float()
+        if self.clamp_mask > 0.0:
+            Mr = torch.tanh(Mr) * self.clamp_mask
+            Mi = torch.tanh(Mi) * self.clamp_mask
         Xr, Xi = Xn.real.float(), Xn.imag.float()
         R, I = self._map_mask(Mr, Mi)
         Xhat = torch.complex(R * Xr - I * Xi, R * Xi + I * Xr)
-        yhat = istft_from(Xhat, win, length=noisy.shape[-1], n_fft=self.n_fft, hop=self.hop)
+        yhat = istft_from(Xhat, win, length=noisy.shape[-1], n_fft=self.n_fft, hop=self.hop)  # (B,T)
+
+        if self.safe_unity and not torch.isfinite(yhat).all():
+            with torch.no_grad():
+                bad = ~torch.isfinite(yhat).all(dim=-1)  # (B,)
+                if bad.any():
+                    # exact-unity reconstruction for the bad samples only
+                    y_unity = istft_from(Xn, win, length=noisy.shape[-1], n_fft=self.n_fft, hop=self.hop)
+                    yhat[bad] = y_unity[bad]
 
         # per-sample proxy
         y_m = yhat if yhat.dim() == 2 else yhat.mean(dim=1)
