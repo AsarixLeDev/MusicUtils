@@ -119,13 +119,15 @@ class CurriculumCallback(Callback):
       - task.mask_limit (stability/expressivity).
     """
     def __init__(self, loss_fn, task, dataset=None,
-                 snr_stages=None, sisdr=None, mask_limit=None):
+                 snr_stages=None, sisdr=None, mask_limit=None,
+                 mask_variant=None):               # <— NEW
         self.loss_fn = loss_fn
         self.task = task
         self.dataset = dataset
         self.snr_stages = snr_stages or []
         self.sisdr = sisdr or {}
         self.mask_limit = mask_limit or {}
+        self.mask_variant = mask_variant or []     # list of {until: int, variant: str}
 
     def _snr_for_epoch(self, epoch):
         # pick last stage whose 'until' >= epoch
@@ -174,6 +176,19 @@ class CurriculumCallback(Callback):
             if hasattr(self.task, "mask_limit"):
                 self.task.mask_limit = target
                 print(f"[curriculum] epoch {e}: mask_limit -> {target:.2f}")
+
+        for st in self.mask_variant:
+            if e <= int(st.get("until", 10 ** 9)):
+                v = str(st.get("variant", "")).lower()
+                if v and hasattr(self.task, "mask_variant"):
+                    self.task.mask_variant = v
+                    # Re-bias head to identity for the new variant
+                    try:
+                        from soundrestorer.models.init_utils import init_head_for_mask
+                        init_head_for_mask(trainer.model, v)
+                    except Exception:
+                        pass
+                break
 
 
 class AudioDebugCallback(Callback):

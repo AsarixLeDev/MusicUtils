@@ -2,6 +2,19 @@ paths:
   runs_root: soundrestorer/runs
   run_name: den_progress
 
+callbacks:
+  curriculum:
+    enable: true
+    snr_stages:
+      - {until: 2,   snr_min: 14, snr_max: 20, use_ext_noise_p: 0.5}
+      - {until: 8,   snr_min:  4, snr_max: 20, use_ext_noise_p: 0.7}
+      - {until: 9999,snr_min: -3, snr_max: 20, use_ext_noise_p: 0.8}
+    sisdr: {start_db: 0.0, end_db: 12.0, end_epoch: 15}
+    mask_limit: {start: 1.25, end: 2.0, end_epoch: 10}
+    mask_variant:
+      - {until: 5,    variant: delta1}   # keep identity-anchored first
+      - {until: 9999, variant: plain}    # switch to complex
+
 data:
   train_manifest: soundrestorer/data/training/train.jsonl
   val_manifest:   soundrestorer/data/training/val.jsonl
@@ -10,12 +23,12 @@ data:
   mono: true
 
   batch: 8
-  workers: 4            # try 4–6 on Windows
+  workers: 8
   prefetch_factor: 4
-  cache_gb: 0.0
-  persistent_workers: true
   pin_memory: true
-  no_cache: true
+  persistent_workers: true
+  cache_gb: 1.0
+  no_cache: false
 
   # dataset-side mixing (if supported by your dataset)
   snr_min: 0.0
@@ -27,6 +40,7 @@ data:
 
   p_clean: 0.10
   add_synth_noise_p: 0.7
+
 
   hard_mining:
     enable: true
@@ -42,18 +56,30 @@ task:
   args:
     n_fft: 1024
     hop: 256
-    mask_variant: plain
-    mask_limit: 1.5     # tightened early; avoids over-boost
+    mask_variant: delta1    # start safe
+    mask_limit: 1.25        # tighter early
 
 losses:
   items:
     - {name: mrstft,      weight: 1.0}
     - {name: l1_wave,     weight: 0.5}
-    - {name: sisdr_ratio, weight: 0.30, args: {min_db: 8.0}}
+    - {name: sisdr_ratio, weight: 0.30, args: {min_db: 6.0, cap: 1.0}}
     - {name: mel_l1,      weight: 0.15, args: {sr: 48000, n_mels: 64, n_fft: 1024, hop: 256}}
     - {name: highband_l1, weight: 0.10, args: {sr: 48000, cutoff_khz: 8.0, n_fft: 1024, hop: 256}}
     - {name: phase_cosine,weight: 0.02, args: {n_fft: 1024, hop: 256}}
     - {name: energy_anchor, weight: 0.010}
+
+loss:
+  train_loss_clip: 0.0    # disable static batch clip
+  train_trim_frac: 0.10   # robust epoch mean
+
+
+debug:
+  step_interval: 100      # print a short [dbg] line every N global steps
+  print_pair_sisdr: true  # include SI(noisy,clean) and SI(yhat,clean) in dbg line
+  print_cuda_mem: true    # show CUDA allocated/reserved MiB in bar postfix
+  print_comp: true        # print per-component train loss means per epoch
+
 
 train:
   epochs: 150
@@ -61,11 +87,12 @@ train:
   ema: 0.995
 
 optim:
-  lr: 4.0e-4
-  warmup_steps: 300
   wd: 1.0e-4
   grad_clip: 3.0
   grad_accum: 1
+  lr: 3.0e-4
+  warmup_steps: 300
+  lr_min_factor: 0.3
 
 runtime:
   amp: bfloat16
@@ -83,9 +110,9 @@ hard_mining:
 
 guard:
   enable: true            # (optional flag; you can ignore in code if you always create it)
-  hard_clip: 6.0          # skip batches with loss above this absolute value
-  window: 512             # rolling window for robust stats
-  mad_k: 6.0              # dynamic outlier threshold (median + k*MAD)
-  snr_floor_db: -3.0      # skip if SI-SDR(noisy,clean) < this
-  min_rms_db: -70.0       # skip near-silence
-  max_peak: 1.2           # skip if input peak is absurdly high
+  hard_clip: 0.0          # skip batches with loss above this absolute value
+  window: 512            # rolling window for MAD
+  mad_k: 6.0             # dynamic outlier threshold
+  snr_floor_db: -6.0     # skip if SNR below this (adjust if you train at very low SNR)
+  min_rms_db: -70.0      # skip near-silence
+  max_peak: 1.2          # skip absurd peaks

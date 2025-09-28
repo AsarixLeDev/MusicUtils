@@ -15,6 +15,12 @@ from soundrestorer.losses.composed import ComposedLoss
 from soundrestorer.data.builder import build_denoise_loader
 from soundrestorer.core.loader import default_loader_args
 
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+try: torch.set_float32_matmul_precision("high")
+except: pass
+
 def parse_args():
     ap = argparse.ArgumentParser("Generic Trainer")
     ap.add_argument("--config", required=True)
@@ -65,6 +71,10 @@ def main():
     # ---- MODEL ----
     model = MODELS.build(cfg["model"]["name"], **cfg["model"].get("args", {})).float().to(device)
 
+    from soundrestorer.models.init_utils import init_head_for_mask
+    task_mask = cfg.get("task", {}).get("args", {}).get("mask_variant", "plain")
+    init_head_for_mask(model, mask_variant=task_mask)
+
     # ---- TASK ----
     from soundrestorer.core.registry import TASKS
     task = TASKS.build(cfg["task"]["name"], **cfg["task"].get("args", {}))
@@ -80,9 +90,10 @@ def main():
                             eps=1e-8,
                             weight_decay=float(opt_cfg.get("wd", 0.0)))
     total_steps = int(cfg["train"]["epochs"]) * max(1, len(tr_ld))
+    min_factor = float(cfg["optim"].get("lr_min_factor", 0.3))
     sched = WarmupCosine(opt, total_steps=total_steps,
-                         warmup=int(opt_cfg.get("warmup_steps", 0)),
-                         min_factor=0.1)
+                         warmup=int(opt_cfg.get("warmup_steps", 300)),
+                         min_factor=min_factor)
 
     # ---- CALLBACKS ----
     cbs = [ConsoleLogger()]
@@ -127,6 +138,7 @@ def main():
             snr_stages=cur.get("snr_stages", []),
             sisdr=cur.get("sisdr", {}),
             mask_limit=cur.get("mask_limit", {}),
+            mask_variant=cur.get("mask_variant", "plain"),
         ))
 
     # audio debug
@@ -166,9 +178,12 @@ def main():
         grad_clip=float(opt_cfg.get("grad_clip", 0.0)), channels_last=ch_last,
         compile_model=compile_ok, callbacks=cbs
     )
-    # expose runtime + guard_cfg to the trainer (if your __init__ doesn’t accept them)
+    # make sure runtime + guard knobs are visible to trainer.fit()
     trainer.runtime = cfg.get("runtime", {})
     trainer.guard_cfg = cfg.get("guard", {})
+    trainer.debug_cfg = cfg.get("debug", {})  # <— NEW
+    trainer.train_loss_clip = cfg.get("loss", {}).get("train_loss_clip", 0.0)
+    trainer.train_trim_frac = cfg.get("loss", {}).get("train_trim_frac", 0.10)
 
     # ---- GO ----
     trainer.fit(tr_ld, va_ld, epochs=int(cfg["train"]["epochs"]), ckpt_saver=None)

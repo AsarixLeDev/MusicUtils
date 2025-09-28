@@ -10,11 +10,12 @@ class L1Wave(LossModule):
 
 @LOSSES.register("sisdr_ratio")
 class SISDRRatio(LossModule):
-    def __init__(self, min_db=0.0):
+    def __init__(self, min_db=0.0, cap=1.0):
         self.min_db = float(min_db)
+        self.cap = float(cap)
+
     def forward(self, outputs, batch):
-        # ratio loss as hinge on SI target
-        eps=1e-8
+        eps = 1e-8
         y = outputs["yhat"]; x = outputs["clean"].float()
         if y.dim()==3: y=y.mean(dim=1); x=x.mean(dim=1)
         xz = x - x.mean(dim=-1, keepdim=True)
@@ -22,9 +23,12 @@ class SISDRRatio(LossModule):
         s = (torch.sum(yz * xz, dim=-1, keepdim=True) /
              (torch.sum(xz * xz, dim=-1, keepdim=True) + eps)) * xz
         e = yz - s
-        si_sdr = 10 * torch.log10(torch.sum(s**2, dim=-1) / (torch.sum(e**2, dim=-1) + eps) + eps)
+        si_sdr = 10 * torch.log10(torch.sum(s**2, dim=-1) /
+                                  (torch.sum(e**2, dim=-1) + eps) + eps)
         denom = max(abs(self.min_db), 1e-6)
         loss = torch.clamp((self.min_db - si_sdr) / denom, min=0.0)
+        if self.cap > 0:
+            loss = torch.clamp(loss, max=self.cap)
         return torch.mean(loss)
 
 @LOSSES.register("mel_l1")
