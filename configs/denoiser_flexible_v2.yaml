@@ -2,35 +2,19 @@ paths:
   runs_root: soundrestorer/runs
   run_name: den_progress
 
-callbacks:
-  curriculum:
-    enable: true
-    snr_stages:
-      - {until: 2,   snr_min: 14, snr_max: 20, use_ext_noise_p: 0.5}
-      - {until: 8,   snr_min:  4, snr_max: 20, use_ext_noise_p: 0.7}
-      - {until: 9999,snr_min: -3, snr_max: 20, use_ext_noise_p: 0.8}
-    sisdr:
-      start_db: 0.0
-      end_db: 12.0
-      end_epoch: 15
-    mask_limit: {start: 1.25, end: 2.0, end_epoch: 12}
-    mask_variant:
-      - {until: 5,    variant: delta1}   # keep identity-anchored first
-      - {until: 9999, variant: plain}    # switch to complex
-
 data:
   train_manifest: soundrestorer/data/training/train.jsonl
   val_manifest:   soundrestorer/data/training/val.jsonl
   sr: 48000
-  crop: 3.0
+  crop: 3.5
   mono: true
 
-  batch: 8
+  batch: 12
   workers: 8
-  prefetch_factor: 4
+  prefetch_factor: 8
   pin_memory: true
   persistent_workers: true
-  cache_gb: 2.0
+  cache_gb: 8.0
   no_cache: false
 
   # dataset-side mixing (if supported by your dataset)
@@ -38,10 +22,10 @@ data:
   snr_max: 20.0
   use_ext_noise_p: 0.5
   min_clean_rms_db: -40.0
-  max_retries: 644
+  max_retries: 24
   out_peak: 0.98
 
-  p_clean: 0.10
+  p_clean: 0.01
   add_synth_noise_p: 0.7
 
 
@@ -63,16 +47,61 @@ task:
     mask_limit: 1.25
     clamp_mask_tanh: 4.0        # NEW: typical safe value (try 3–6)
     safe_unity_fallback: true   # NEW
+    mask_floor: 0.85
+
+callbacks:
+  curriculum:
+    enable: true
+    # keep harder noise in view; widen as we go
+    snr_stages:
+      - {until: 2,    snr_min: 10, snr_max: 20, use_ext_noise_p: 0.5}
+      - {until: 6,    snr_min:  4, snr_max: 20, use_ext_noise_p: 0.7}
+      - {until: 9999, snr_min: -2, snr_max: 20, use_ext_noise_p: 0.8}
+    # keep delta1 longer; switch later
+    mask_variant:
+      - { until: 9999, variant: delta1 }
+    mask_limit: {start: 1.00, end: 1.10, end_epoch: 12}
+    mask_reg:   {start_w: 0.05, end_w: 0.00, end_epoch: 4}
+    sisdr_weight: {start_w: 0.10, end_w: 0.30, end_epoch: 10}
+
+  # (optional) on-the-fly procedural noise to ensure truly noisy training batches
+  proc_noise: { enable: true, prob: 1.0, snr_min: 0.0, snr_max: 20.0 }
+
+  audio_debug:
+    enable: true
+    every: 2
+    num_items: 3
+    min_noisy_snr_db: 25.0
+    max_silence_frac: 0.95
+    scan_tries: 400
+
+  data_audit:
+    enable: true
+    first_epochs: 1      # audit only the first epoch (change to 2+ if you want)
+    max_batches: 3       # take at most 3 train batches
+    max_items: 12        # and save at most 12 items total
+    silence_rms_db: -60  # clips below this clean RMS are flagged as "silent"
+    save_audio: true
+    save_csv: true
+
+  ensure_min_snr:
+    enable: true
+    min_snr_db: 25.0     # anything "noisier than this" is considered too clean and will be fixed
+    snr_min: 4.0
+    snr_max: 20.0
+    train_only: true
 
 losses:
   items:
-    - {name: mrstft,      weight: 1.0}
-    - {name: l1_wave,     weight: 0.5}
-    - {name: sisdr_ratio, weight: 0.30, args: {min_db: 6.0, cap: 1.0}}
-    - {name: mel_l1,      weight: 0.15, args: {sr: 48000, n_mels: 64, n_fft: 1024, hop: 256}}
-    - {name: highband_l1, weight: 0.10, args: {sr: 48000, cutoff_khz: 8.0, n_fft: 1024, hop: 256}}
-    - {name: phase_cosine,weight: 0.02, args: {n_fft: 1024, hop: 256}}
-    - {name: energy_anchor, weight: 0.010}
+    - { name: mrstft,          weight: 1.0,
+        args: { fft_sizes: [ 1024, 2048 ], hops: [ 256, 512 ], win_lengths: [ 1024, 2048 ] } }
+    - { name: l1_wave,         weight: 0.50 }
+    - { name: sisdr_ratio,     weight: 0.10, args: { min_db: 3.0, cap: 1.0 } }
+    - { name: mask_unity_reg,  weight: 0.02 }         # <-- KEEP this small but non-zero
+    - { name: energy_anchor,   weight: 0.01 }         # <-- keeps output energy sane
+    # Optional stabilizers once ΔSI turns positive (add later if desired):
+#    - {name: mel_l1, weight: 0.05, args: {sr: 48000, n_mels: 64, n_fft: 1024, hop: 256}}
+    # - {name: phase_cosine,    weight: 0.01, args: {n_fft: 1024, hop: 256}}
 
 loss:
   train_trim_frac: 0.10
@@ -87,34 +116,46 @@ debug:
   pbar_every: 8
   dump_skips: false       # no WAV dump on skipped batches
   print_cuda_mem: false   # lighter bars
+  profile_first_steps: 10
+  sisdr_log_first: 10   # log shapes for first 2 val batches
+#  sisdr_probe_print: false
+  val_every: 1          # validate every 2 epochs
+  val_max_batches: 8    # cap val batches
+  val_no_clean: true    # force dataset.p_clean=0.0 for val if available
+  sisdr_ignore_if_noisy_gt_db: 25.0   # was 35 → be stricter
+
 
 
 train:
-  epochs: 150
-  save_every: 1
-  ema: 0.995
+  epochs: 100
+#  epochs: 150
+#  save_every: 1
+#  ema: 0.995
 
 optim:
   wd: 1.0e-4
   grad_clip: 3.0
   grad_accum: 1
-  warmup_steps: 200     # from 300 (or 500 → 200)
+  warmup_steps: 50    # was 200
   lr: 3.0e-4
   lr_min_factor: 0.3
+
+#runtime: { amp: bfloat16 }
 
 runtime:
   amp: bfloat16
   channels_last: true
   cuda_graph: false
-  compile: false
+  compile: true
   compile_backend: inductor   # tries Triton if present, else falls back to aot_eager
   compile_mode: default       # default is fine; avoid "max-autotune" on your card
   cuda_prefetch: true
   guard_rescue_after: 32
   guard_rescue_skip_ratio: 0.5
-  warmup_batches: 8    # try 4–8; 0 disables warmup
+  warmup_batches: 4    # try 4–8; 0 disables warmup
 
 hard_mining:
+  enable: true
   start_epoch: 3
   ema: 0.9
   top_frac: 0.30
@@ -131,6 +172,6 @@ guard:
   mad_floor_rel: 0.20
   rel_factor: 1.6
   mad_k: 8.0          # was 6.0
-  snr_floor_db: -9.0  # was -6.0
+  snr_floor_db: -12  # was -6.0
   min_rms_db: -70.0
   max_peak: 1.2

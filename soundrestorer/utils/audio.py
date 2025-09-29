@@ -1,10 +1,10 @@
 from __future__ import annotations
 import torch
 
-def hann_window(n_fft, device):
+def hann_window(n_fft, device, dtype=torch.float32):
     # sqrt-Hann for COLA
-    w = torch.hann_window(n_fft, periodic=True, device=device, dtype=torch.float32)
-    return torch.sqrt(torch.clamp(w, min=0))
+    w = torch.hann_window(n_fft, periodic=True, device=device, dtype=dtype if dtype is not None else torch.float32)
+    return torch.sqrt(torch.clamp(w, min=0)).to(dtype or torch.float32)
 
 def _as_batch_mono(x: torch.Tensor) -> torch.Tensor:
     if x.dim() == 1: return x.unsqueeze(0)
@@ -12,16 +12,126 @@ def _as_batch_mono(x: torch.Tensor) -> torch.Tensor:
     if x.dim() == 3: return x.mean(dim=1)
     raise RuntimeError(f"Expected 1D/2D/3D waveform, got shape {tuple(x.shape)}")
 
+
 @torch.no_grad()
-def si_sdr_db(y: torch.Tensor, x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    if y.dim() == 3: y = y.mean(dim=1); x = x.mean(dim=1)
-    xz = x - x.mean(dim=-1, keepdim=True)
-    yz = y - y.mean(dim=-1, keepdim=True)
-    s = (torch.sum(yz * xz, dim=-1, keepdim=True) / (torch.sum(xz * xz, dim=-1, keepdim=True) + eps)) * xz
-    e = yz - s
-    num = torch.sum(s ** 2, dim=-1)
-    den = torch.sum(e ** 2, dim=-1) + eps
-    return 10.0 * torch.log10(num / den + eps)
+def sisdr_improvement_db(
+    yhat: torch.Tensor,
+    noisy: torch.Tensor,
+    clean: torch.Tensor,
+    eps: float = 1e-8,
+    trim_frac: float = 0.0,
+) -> torch.Tensor:
+    """
+    Mean (or trimmed mean) SI-SDR improvement in dB across the batch.
+    """
+    si_n = si_sdr_db(noisy, clean, eps=eps)      # (B,)
+    si_r = si_sdr_db(yhat,  clean, eps=eps)      # (B,)
+    d = si_r - si_n                               # (B,)
+
+    if trim_frac <= 0:
+        return d.mean()
+
+    k = int(d.numel() * trim_frac)
+    if k <= 0:
+        return d.mean()
+    d_sorted, _ = torch.sort(d)
+    core = d_sorted[k: d_sorted.numel() - k]
+    if core.numel() == 0:
+        core = d_sorted
+    return core.mean()
+
+@torch.no_grad()
+def si_sdr_db(
+    y: torch.Tensor,
+    x: torch.Tensor,
+    eps: float = 1e-8,
+    zero_mean: bool = True,
+    clamp_db_min: float | None = -60.0,
+    match_length: bool = True,
+    debug_shapes: int = 0,         # <— NEW: log shapes for first N calls
+) -> torch.Tensor:
+    """
+    Robust scale-invariant SDR in dB, with optional one-shot shape logging.
+
+    Accepts (B,T) or (B,C,T) (and (T)/(C,T), auto-batched).
+    If either has channels, BOTH are downmixed to mono to avoid broadcasting.
+    If match_length=True, trims both to min length.
+    """
+    # -------- tiny helper to print once/few times --------
+    # Reduce noise: only print for the first `debug_shapes` invocations (per process)
+    if not hasattr(si_sdr_db, "_dbg_count"):
+        si_sdr_db._dbg_count = 0
+
+    def _pfx(ok: bool) -> str:
+        return "[si_sdr_db]" if ok else "[si_sdr_db:WARN]"
+
+    def _stats(name: str, t: torch.Tensor) -> str:
+        t32 = t.detach()
+        m = float(t32.mean()) if t32.numel() else 0.0
+        s = float(t32.std())  if t32.numel() else 0.0
+        fin = bool(torch.isfinite(t32).all())
+        return f"{name}: shape={tuple(t.shape)}, dtype={t.dtype}, dev={t.device}, mean={m:.3e}, std={s:.3e}, finite={fin}"
+
+    log_now = si_sdr_db._dbg_count < int(debug_shapes)
+
+    # --- normalize shapes to (B,T) ---
+    def _to_bt(t: torch.Tensor) -> torch.Tensor:
+        if t.dim() == 1:  return t.unsqueeze(0)
+        if t.dim() == 2:  return t
+        if t.dim() == 3:  return t.mean(dim=1)
+        raise RuntimeError(f"Unexpected tensor shape {tuple(t.shape)} for SI-SDR")
+
+    y0, x0 = y, x  # keep originals for debug prints
+    y = _to_bt(y); x = _to_bt(x)
+
+    # --- optional length alignment ---
+    if match_length:
+        T = min(y.shape[-1], x.shape[-1])
+        if y.shape[-1] != T: y = y[..., :T]
+        if x.shape[-1] != T: x = x[..., :T]
+
+    if zero_mean:
+        y = y - y.mean(dim=-1, keepdim=True)
+        x = x - x.mean(dim=-1, keepdim=True)
+
+    if log_now:
+        print(_pfx(True), "INPUTS")
+        print(" ", _stats("y_in", y0))
+        print(" ", _stats("x_in", x0))
+        print(_pfx(True), "NORMALIZED")
+        print(" ", _stats("y_bt", y))
+        print(" ", _stats("x_bt", x))
+        si_sdr_db._dbg_count += 1
+
+    # basic sanity checks
+    assert y.shape[:2] == x.shape[:2], f"Batch/length mismatch after normalization: y{y.shape} vs x{x.shape}"
+
+    # --- projection ---
+    xx = torch.sum(x * x, dim=-1, keepdim=True).clamp_min(eps)
+    scale = torch.sum(y * x, dim=-1, keepdim=True) / xx
+    s = scale * x
+    e = y - s
+
+    num = torch.sum(s * s, dim=-1).clamp_min(eps)
+    den = torch.sum(e * e, dim=-1).clamp_min(eps)
+    sisdr = 10.0 * torch.log10(num / den)
+
+    if clamp_db_min is not None:
+        floor = torch.tensor(clamp_db_min, device=sisdr.device, dtype=sisdr.dtype)
+        sisdr = torch.maximum(sisdr, floor)
+
+    bad = ~torch.isfinite(sisdr)
+    if bad.any():
+        fill = torch.tensor(clamp_db_min if clamp_db_min is not None else -60.0,
+                            device=sisdr.device, dtype=sisdr.dtype)
+        sisdr = sisdr.masked_fill(bad, fill)
+
+    if log_now:
+        print(_pfx(True), f"SI-SDR batch={tuple(sisdr.shape)} mean={float(sisdr.mean()):.2f} dB (min={float(sisdr.min()):.2f}, max={float(sisdr.max()):.2f})")
+
+    return sisdr
+
+
 
 def stft_any(x: torch.Tensor, n_fft: int, hop: int, win: torch.Tensor) -> torch.Tensor:
     x = _as_batch_mono(x)
