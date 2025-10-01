@@ -1,0 +1,3 @@
+python tools/sanity_suite.py --manifest soundrestorer/data/training/train.jsonl --sr 48000 --mono
+
+python tools/repo_doctor.py --config configs/denoiser_flexible_v2.yaml --write-report repo_doctor.md --json repo_doctor.json

@@ -1,0 +1,113 @@
+# ======================================================================
+# Music denoising (stems + realistic noise), full training recipe
+# Goal: best perceptual quality with stable, positive losses
+# ======================================================================
+
+paths:
+  runs_root: runs
+  run_name: denoiser_music
+
+# --- DATA ---
+data:
+  # (future) stems+mixture manifest built by tools/build_manifest_musdb.py & build_manifest_moises.py
+  # A single JSONL that lists music stems/mixtures; the current loader will ignore extra fields
+  train_manifest: manifests/music_stems_train.jsonl
+  val_manifest:   manifests/music_stems_val.jsonl
+
+  # Optional external noise corpora (future: used by new mixer; safe to keep listed now)
+  noise_manifests:
+    - manifests/musan_musicnoise.jsonl
+    - manifests/demand.jsonl
+
+  # Audio basics
+  sr: 48000
+  crop: 4.0              # seconds per training crop (music benefits from slightly longer windows)
+  mono: true
+
+  # Loader
+  batch: 12
+  workers: 8
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+
+  # Dataset-side mixing knobs (compatible with current loader, used now)
+  snr_min: 0.0           # curriculum handled by callbacks soon; static bounds here are fine
+  snr_max: 20.0
+  use_ext_noise_p: 0.6   # probability to pick external noise when available
+  p_clean: 0.05          # small chance to pass clean -> regularization
+  out_peak: 0.98
+
+  # (future) target/control for stems
+  target: mixture        # train to denoise the full mixture (leave musical content intact)
+  allowed_stems: [vocals, drums, bass, other]  # documented only; loader will ignore until added
+
+# --- MODEL ---
+model:
+  name: complex_unet_auto
+  args:
+    base: 56             # a touch larger than 48 for music textures (≈9.3M params in your logs)
+    # (future) attention blocks can be toggled later with an "attn: true" flag
+
+# --- TASK ---
+task:
+  name: denoise_stft
+  args:
+    mask_variant: mag_sigmoid  # bounded, stable residual-style magnitude mask
+    mask_floor: 0.30           # allow strong attenuation
+    mask_limit: 1.60           # allow mild boosting (protects transients)
+    clamp_mask_tanh: 0.0       # not needed with mag_sigmoid
+    safe_unity_fallback: true
+
+# --- LOSSES ---
+# Keep losses strictly positive so the total trends to small positive values.
+# We'll introduce a positive SI-SDR variant later; for now rely on waveform + MRSTFT.
+losses:
+  items:
+    - { name: mrstft,  weight: 0.10,
+        args: { fft_sizes: [1024, 2048, 4096], hops: [256, 512, 1024], win_lengths: [1024, 2048, 4096] } }
+    - { name: l1_wave, weight: 1.00 }
+    # (optional, positive & bounded in your code) uncomment after confirming stability:
+    # - { name: sisdr_ratio, weight: 0.50, args: { min_db: 0.0, cap: 1.0 } }
+
+# --- OPTIMIZER ---
+optim:
+  lr: 3.0e-4
+  wd: 0.01
+  grad_clip: 3.0
+  grad_accum: 1
+  warmup_steps: 280       # ≈ 4 warmup epochs at 70 steps/epoch
+  lr_min_factor: 0.05     # cosine floor
+
+# --- TRAIN ---
+train:
+  epochs: 60
+  save_every: 1
+  ema: 0.995              # EMA helps perceptual stability
+
+# --- CALLBACKS ---
+# Keep empty to avoid argument mismatches while we upgrade callbacks next.
+callbacks: {}
+
+# --- HARD MINING ---
+hard_mining:
+  enable: false
+
+# --- DEBUG / LOGGING ---
+debug:
+  overfit_steps: 0
+  val_every: 1
+  val_max_batches: 7
+  sisdr_ignore_if_noisy_gt_db: 25.0
+  sisdr_probe_max_batches: 0
+  pbar_every: 8
+  print_comp: true
+
+# --- RUNTIME ---
+runtime:
+  amp: bfloat16
+  channels_last: true
+  cuda_graph: false
+  compile: true
+  cuda_prefetch: true
+  warmup_batches: 4

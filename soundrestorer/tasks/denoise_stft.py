@@ -1,7 +1,7 @@
 from __future__ import annotations
 import torch
 from typing import Tuple
-from ..utils.audio import hann_window, stft_pair, istft_from
+from ..utils.audio import stft_pair, istft_from
 from ..core.registry import TASKS
 
 @TASKS.register("denoise_stft")
@@ -10,7 +10,7 @@ class DenoiseSTFTTask:
                  clamp_mask_tanh: float = 0.0,
                  safe_unity_fallback: bool = True,
                  device="cuda",
-                 mask_floor: float = 0.0):                 # <-- NEW
+                 mask_floor: float = 0.50):                 # <-- NEW
         self.n_fft=int(n_fft); self.hop=int(hop)
         self.mask_variant=str(mask_variant).lower()
         self.mask_limit=float(mask_limit)
@@ -26,38 +26,47 @@ class DenoiseSTFTTask:
         Trainer clears self._win after warmup to rebuild under normal autograd.
         """
         if (self._win is None) or (self._win.device != device) or (self._win.dtype != dtype):
-            self._win = hann_window(self.n_fft, device=device, dtype=dtype)
+            self._win = torch.hann_window(self.n_fft, device=device, dtype=dtype)
         return self._win  # no clone: reuse the buffer
 
     def _map_mask(self, Mr: torch.Tensor, Mi: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         v = self.mask_variant
         if v == "mag_sigm1":
-            Mag = 1.0 + (torch.sigmoid(Mr) - 0.5)
+            Mag = 1.0 + (torch.sigmoid(Mr) - 0.5)  # 0.5 residual range
             R, I = Mag, torch.zeros_like(Mag)
         elif v == "mag":
-            Mag = torch.sqrt(Mr**2 + Mi**2 + 1e-8)
+            # base magnitude-only (gradient ok everywhere)
+            Mag = torch.relu(Mr) + 1.0  # softplus-like but cheaper
             R, I = Mag, torch.zeros_like(Mag)
         elif v == "delta1":
-            R, I = 1.0 + Mr, Mi
+            R, I = 1.0 + Mr, Mi  # complex residual (may rotate phase)
         elif v == "mag_delta1":
-            Mag = 1.0 + torch.sqrt(Mr**2 + Mi**2 + 1e-8)
+            # >>> FIX: residual magnitude with non-zero grad at 0
+            # ignore Mi for magnitude; let phase come only from Xn
+            Mag = 1.0 + Mr  # gradient @ 0 is 1.0
             R, I = Mag, torch.zeros_like(Mag)
+        elif v == "mag_sigmoid":
+            # smooth, bounded magnitude mask in [mask_floor, mask_limit]
+            # assumes mask_floor < mask_limit and both > 0
+            floor = torch.tensor(getattr(self, "mask_floor", 0.5), device=Mr.device, dtype=Mr.dtype)
+            limit = torch.tensor(getattr(self, "mask_limit", 1.6), device=Mr.device, dtype=Mr.dtype)
+            width = torch.clamp(limit - floor, min=1e-3)
+            M = floor + width * torch.sigmoid(Mr)  # Mr is raw head output (tanh-clamped if you keep it)
+            R, I = M, torch.zeros_like(M)
         else:  # "plain"
             R, I = Mr, Mi
 
-        # Two-sided radial clamp on complex mask magnitude:
-        #   enforce |M| in [mask_floor, mask_limit] if set.
+        # two-sided clamp on applied magnitude: M in [mask_floor, mask_limit]
         mag_eff = torch.sqrt(R ** 2 + I ** 2 + 1e-8)
         scale = torch.ones_like(mag_eff)
-
-        # Upper bound
-        if self.mask_limit > 0:
-            scale = torch.minimum(scale, self.mask_limit / mag_eff)
-
-        # Lower bound (prevents "mute the signal" collapse)
-        if self.mask_floor > 0:
-            scale = torch.maximum(scale, self.mask_floor / mag_eff)
-
+        if getattr(self, "mask_floor", 0.0) > 0.0:
+            scale = torch.where(mag_eff < self.mask_floor,
+                                self.mask_floor / (mag_eff + 1e-8),
+                                scale)
+        if getattr(self, "mask_limit", 0.0) > 0.0:
+            scale = torch.where(mag_eff > self.mask_limit,
+                                self.mask_limit / (mag_eff + 1e-8),
+                                scale)
         R, I = R * scale, I * scale
         return R, I
 

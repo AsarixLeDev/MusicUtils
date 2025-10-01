@@ -1,0 +1,108 @@
+paths:
+  runs_root: runs
+  run_name: denoiser_proc_overfit
+
+data:
+  train_manifest: manifests/music_stems_train.jsonl   # your stems/mixture manifest
+  val_manifest:   manifests/music_stems_val.jsonl
+  sr: 48000
+  crop: 3.0
+  mono: true
+
+  batch: 1
+  workers: 0
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: false
+
+  # IMPORTANT: no external noise
+  noise_manifests: []
+  use_ext_noise_p: 0.0
+  p_clean: 0.0         # don't pass clean through in this test
+  out_peak: 0.98
+
+model:
+  name: music_unet
+  args:
+    base: 48
+    depth: 5
+    out_ch: 1
+
+task:
+  name: denoise_stft_music
+  args:
+    n_fft: 1024
+    hop_length: 256
+    win_length: 1024
+    mask_variant: mag_sigmoid
+    mask_floor: 0.30
+    mask_limit: 1.80
+    clamp_mask_tanh: 0.0
+    safe_unity_fallback: true
+    return_debug: false
+
+losses:
+  items:
+    - { name: mrstft,  weight: 0.02,
+        args: { fft_sizes: [1024, 2048], hops: [256, 512], win_lengths: [1024, 2048] } }
+    - { name: l1_wave, weight: 1.00 }
+    - { name: sisdr_pos, weight: 1.50 }
+
+optim:
+  lr: 1.0e-3
+  wd: 0.0
+  grad_clip: 0.0
+  grad_accum: 1
+  warmup_steps: 0
+  lr_min_factor: 1.0
+
+train:
+  epochs: 1
+  save_every: 1
+  ema: 0.0
+
+callbacks:
+  # turn procedural noise on here
+  proc_noise:
+    enable: true
+    prob: 1.0          # apply to every batch in this micro-test
+    snr_min: 0.0
+    snr_max: 12.0
+    noise_cfg:
+      # these keys are supported by your existing NoiseFactory
+      mix:
+        white: 0.5
+        pink: 0.5
+      hum:
+        enable: true
+        freq_hz: [50, 60]
+        harmonics: 3
+        jitter_hz: 0.5
+      hiss:
+        enable: true
+        band_hz: [8000, 16000]
+  audio_debug:
+    enable: true
+    per_epoch: 3
+    scan_batches: 16
+  data_audit:
+    enable: true
+    max_items: 12
+    take_from_batches: 6
+
+hard_mining: { enable: false }
+
+debug:
+  overfit_steps: 300
+  val_every: 1
+  val_max_batches: 2
+  pbar_every: 8
+  print_comp: true
+
+runtime:
+  amp: float32
+  channels_last: true
+  cuda_graph: false
+  compile: false
+  cuda_prefetch: true
+  warmup_batches: 0

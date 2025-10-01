@@ -549,57 +549,100 @@ class EmaEvalSwap(Callback):
 
 class DataAuditCallback(Callback):
     """
-    Saves a few (noisy, clean, residual) audio triads from TRAIN batches and writes a CSV
-    with metrics: duration, RMS dB, SNR dB, silence flags.
+    Train-time saver: write a few (noisy, clean, resid_true) WAV triads + CSV with metrics.
+    Filters out silent & too-clean items and uses *shared* normalization per triad so SNR remains audible.
 
-    Only touches the first few batches (to keep overhead tiny).
-    Place this callback *after* ProcNoiseAugmentCallback in the list so we audit post-augment audio.
+    IMPORTANT: put this callback AFTER ProcNoiseAugmentCallback and EnsureMinSNRCallback
+    so we audit the post-augment 'noisy'.
     """
     def __init__(self, out_dir: str, sr: int = 48000,
-                 first_epochs: int = 1, max_batches: int = 2, max_items: int = 8,
-                 silence_rms_db: float = -60.0, save_audio: bool = True, save_csv: bool = True):
+                 first_epochs: int = 1,
+                 max_batches: int = 3,
+                 max_items: int = 12,
+                 max_keep_snr_db: float = 25.0,   # keep items with SNR(noisy,clean) ≤ this
+                 max_silence_frac: float = 0.95,  # drop items with >95% near-zero
+                 normalize_peak_dbfs: float = -1.0,  # shared peak for (noisy,clean,resid)
+                 save_csv: bool = True,
+                 emph_snr_db: float | None = None  # OPTIONAL: also save noisy mixed to target SNR (e.g., 12.0)
+                 ):
         import os
         self.sr = int(sr)
         self.first_epochs = int(first_epochs)
         self.max_batches = int(max_batches)
         self.max_items = int(max_items)
-        self.silence_rms_db = float(silence_rms_db)
-        self.save_audio = bool(save_audio)
+        self.max_keep_snr_db = float(max_keep_snr_db)
+        self.max_silence_frac = float(max_silence_frac)
+        self.normalize_peak_dbfs = float(normalize_peak_dbfs)
         self.save_csv = bool(save_csv)
-        self.root = os.path.join(out_dir, "data_audit")
-        os.makedirs(self.root, exist_ok=True)
+        self.emph_snr_db = (float(emph_snr_db) if emph_snr_db is not None else None)
+        self.root = os.path.join(out_dir, "data_audit"); os.makedirs(self.root, exist_ok=True)
 
-        # state
         self._epoch_dir = None
-        self._batch_count = 0
+        self._batch_seen = 0
         self._saved = 0
         self._rows = []
 
-    def _bt(self, t):
-        # to (B,T) mono float32 CPU
-        if t.dim() == 3:
-            t = t.mean(dim=1)
-        elif t.dim() == 1:
-            t = t.unsqueeze(0)
-        return t.detach().to("cpu", dtype=torch.float32, non_blocking=True)
+    # ----- helpers -----
+    def _bt_mono(self, t):
+        import torch
+        # (B,C,T)->(B,T), (B,T)->(B,T), (T,)->(1,T)
+        if t.dim() == 1: return t.unsqueeze(0)
+        if t.dim() == 3: return t.mean(dim=1)
+        if t.dim() == 2: return t
+        raise RuntimeError(f"Unexpected tensor shape {tuple(t.shape)}")
 
-    def _rms_db(self, x, eps=1e-12):
-        rms = (x**2).mean(dim=-1).clamp_min(eps).sqrt()
-        return 20.0 * torch.log10(rms)
+    def _rms_dbfs(self, x, eps=1e-12):
+        import torch
+        rms = torch.sqrt(torch.mean(x**2) + eps)
+        return float(20.0 * torch.log10(rms + eps))
 
-    def _snr_db(self, noisy, clean, eps=1e-12):
-        resid = noisy - clean
-        num = (clean**2).sum(dim=-1).clamp_min(eps)
-        den = (resid**2).sum(dim=-1).clamp_min(eps)
-        return 10.0 * torch.log10(num / den)
+    def _peak(self, x):
+        import torch
+        return float(torch.max(torch.abs(x)))
 
-    @torch.no_grad()
+    def _peak_dbfs(self, x, eps=1e-12):
+        import torch
+        peak = torch.max(torch.abs(x))
+        return float(20.0 * torch.log10(peak + eps))
+
+    def _silence_frac(self, x, thr_dbfs=-60.0):
+        import torch
+        thr = 10.0 ** (thr_dbfs / 20.0)
+        return float((torch.abs(x) < thr).float().mean())
+
+    def _snr_db(self, clean_bt, noisy_bt, eps=1e-12):
+        import torch
+        n = min(clean_bt.shape[-1], noisy_bt.shape[-1])
+        c = clean_bt[..., :n]; y = noisy_bt[..., :n]
+        num = (c**2).sum(dim=-1).clamp_min(eps)
+        den = ((y - c)**2).sum(dim=-1).clamp_min(eps)
+        return 10.0 * torch.log10(num/den)  # (B,)
+
+    def _shared_norm(self, n_1d, c_1d, r_1d, target_dbfs=-1.0):
+        import torch
+        peak = max(self._peak(n_1d), self._peak(c_1d), self._peak(r_1d))
+        if peak <= 0: return n_1d, c_1d, r_1d
+        tgt = 10.0**(target_dbfs/20.0)
+        g = tgt / peak
+        return n_1d * g, c_1d * g, r_1d * g
+
+    def _mix_to_target_snr(self, clean_1d, resid_1d, target_snr_db: float, eps=1e-12):
+        """
+        Return noisy_tgt = clean + alpha*resid where SNR(clean, noisy_tgt) ≈ target_snr_db.
+        """
+        import torch, math
+        Pc = torch.mean(clean_1d**2).clamp_min(eps)
+        Pr = torch.mean(resid_1d**2).clamp_min(eps)
+        alpha = torch.sqrt(Pc / (Pr * (10.0**(target_snr_db/10.0))))
+        return clean_1d + alpha * resid_1d
+
+    # ----- lifecycle -----
     def on_epoch_start(self, trainer=None, state=None, **_):
         import os
         if state.epoch <= self.first_epochs:
             self._epoch_dir = os.path.join(self.root, f"ep{state.epoch:03d}")
             os.makedirs(self._epoch_dir, exist_ok=True)
-            self._batch_count = 0
+            self._batch_seen = 0
             self._saved = 0
             self._rows = []
             print(f"[data-audit] will save up to {self.max_items} items from {self.max_batches} batches -> {self._epoch_dir}")
@@ -608,78 +651,102 @@ class DataAuditCallback(Callback):
 
     @torch.no_grad()
     def on_batch_start(self, trainer=None, state=None, batch=None, **_):
-        if self._epoch_dir is None:
-            return
-        if self._batch_count >= self.max_batches or self._saved >= self.max_items:
-            return
-        self._batch_count += 1
+        if self._epoch_dir is None: return
+        if self._batch_seen >= self.max_batches or self._saved >= self.max_items: return
+        self._batch_seen += 1
 
         try:
-            import torchaudio
+            import torchaudio, torch
         except Exception:
-            torchaudio = None
-            if self.save_audio:
-                print("[data-audit] torchaudio not available; will skip audio saving.")
-
-        if not (isinstance(batch, (list, tuple)) and len(batch) >= 2):
+            print("[data-audit] torchaudio/torch not available; skipping")
             return
 
-        noisy = self._bt(batch[0])
-        clean = self._bt(batch[1])
-        B, T = noisy.shape
+        if not (isinstance(batch, (list, tuple)) and len(batch) >= 2): return
+
+        noisy = batch[0].detach().to(torch.float32)
+        clean = batch[1].detach().to(torch.float32)
+
+        noisy_bt = self._bt_mono(noisy)   # (B,T)
+        clean_bt = self._bt_mono(clean)   # (B,T)
+        B, T = noisy_bt.shape
         dur = float(T) / float(self.sr)
 
-        rms_n = self._rms_db(noisy)
-        rms_c = self._rms_db(clean)
-        snr = self._snr_db(noisy, clean)
+        snr = self._snr_db(clean_bt, noisy_bt)  # (B,)
+        sil_n = torch.tensor([self._silence_frac(noisy_bt[i]) for i in range(B)])
+        sil_c = torch.tensor([self._silence_frac(clean_bt[i]) for i in range(B)])
 
-        silent_c = (rms_c < self.silence_rms_db)
-        silent_n = (rms_n < self.silence_rms_db)
-
-        # rows for CSV
         for i in range(B):
-            if self._saved >= self.max_items:
-                break
+            if self._saved >= self.max_items: break
+            # filters
+            if sil_n[i] > self.max_silence_frac or sil_c[i] > self.max_silence_frac:
+                continue
+            if float(snr[i]) > self.max_keep_snr_db:
+                continue
+
+            base = os.path.join(self._epoch_dir, f"b{self._batch_seen:02d}_i{i:02d}_SNR{float(snr[i]):+.1f}dB")
+
+            # signals (1D mono)
+            n_m = noisy_bt[i].clone()
+            c_m = clean_bt[i].clone()
+            r_m = (n_m - c_m)
+
+            # shared normalization (keeps SNR perceptible)
+            if self.normalize_peak_dbfs is not None:
+                n_m, c_m, r_m = self._shared_norm(n_m, c_m, r_m, self.normalize_peak_dbfs)
+
+            # optional emphasized version at target SNR for quick listening
+            if self.emph_snr_db is not None:
+                n_tgt = self._mix_to_target_snr(c_m, r_m, float(self.emph_snr_db))
+                # use the same shared peak again (with r_m unchanged) so loudness comparable
+                if self.normalize_peak_dbfs is not None:
+                    n_tgt, c_tgt, r_tgt = self._shared_norm(n_tgt, c_m, r_m, self.normalize_peak_dbfs)
+                else:
+                    n_tgt, c_tgt, r_tgt = n_tgt, c_m, r_m
+
+            # save audio
+            try:
+                torchaudio.save(base + "_noisy.wav", n_m.unsqueeze(0).cpu(), self.sr)
+                torchaudio.save(base + "_clean.wav", c_m.unsqueeze(0).cpu(), self.sr)
+                torchaudio.save(base + "_resid.wav", r_m.unsqueeze(0).cpu(), self.sr)
+                if self.emph_snr_db is not None:
+                    torchaudio.save(base + f"_noisy_tgtSNR{int(self.emph_snr_db)}dB.wav",
+                                    n_tgt.unsqueeze(0).cpu(), self.sr)
+            except Exception as e:
+                print(f"[data-audit] save failed: {e}")
+                continue
+
+            # CSV row
             row = dict(
-                epoch=state.epoch, batch=self._batch_count, idx=i,
+                epoch=state.epoch, batch=self._batch_seen, idx=i,
                 dur_s=dur,
-                rms_clean_db=float(rms_c[i]),
-                rms_noisy_db=float(rms_n[i]),
                 snr_db=float(snr[i]),
-                clean_silent=bool(silent_c[i]),
-                noisy_silent=bool(silent_n[i]),
+                rms_noisy_dbfs=self._rms_dbfs(noisy_bt[i]),
+                rms_clean_dbfs=self._rms_dbfs(clean_bt[i]),
+                peak_noisy_dbfs=self._peak_dbfs(noisy_bt[i]),
+                peak_clean_dbfs=self._peak_dbfs(clean_bt[i]),
+                silence_noisy_frac=float(sil_n[i]),
+                silence_clean_frac=float(sil_c[i]),
             )
             self._rows.append(row)
-
-            if self.save_audio and torchaudio is not None:
-                base = os.path.join(self._epoch_dir, f"b{self._batch_count:02d}_i{i:02d}")
-                resid = (noisy[i] - clean[i]).unsqueeze(0)  # (1,T)
-                torchaudio.save(base + "_noisy.wav", noisy[i].unsqueeze(0), self.sr)
-                torchaudio.save(base + "_clean.wav", clean[i].unsqueeze(0), self.sr)
-                torchaudio.save(base + "_resid.wav", resid, self.sr)
             self._saved += 1
 
     def on_epoch_end(self, trainer=None, state=None, **_):
-        if self._epoch_dir is None:
-            return
-        import csv, os
-        # print quick summary
-        import numpy as np
+        if self._epoch_dir is None: return
+        import csv, os, numpy as np
         if self._rows:
             snrs = np.array([r["snr_db"] for r in self._rows], dtype=float)
-            rmsc = np.array([r["rms_clean_db"] for r in self._rows], dtype=float)
-            sil_rate = float(np.mean([r["clean_silent"] for r in self._rows])) if self._rows else 0.0
-            print(f"[data-audit] {len(self._rows)} items | SNR mean {snrs.mean():+.2f} dB (min {snrs.min():+.2f}, max {snrs.max():+.2f}) "
-                  f"| clean_silent_rate {sil_rate*100:.1f}% | dur≈{self._rows[0]['dur_s']:.2f}s")
-        # write CSV
-        if self.save_csv and self._rows:
-            csv_path = os.path.join(self._epoch_dir, "audit.csv")
-            with open(csv_path, "w", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=list(self._rows[0].keys()))
-                w.writeheader()
-                for r in self._rows:
-                    w.writerow(r)
-            print(f"[data-audit] wrote {csv_path}")
+            sil = np.array([r["silence_noisy_frac"] for r in self._rows], dtype=float)
+            print(f"[data-audit] saved {len(self._rows)} items | SNR mean {snrs.mean():+.2f} dB "
+                  f"(min {snrs.min():+.2f}, max {snrs.max():+.2f}) | noisy_sil>95% count {(sil>0.95).sum()}")
+            if self.save_csv:
+                csv_path = os.path.join(self._epoch_dir, "audit.csv")
+                with open(csv_path, "w", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=list(self._rows[0].keys()))
+                    w.writeheader()
+                    for r in self._rows:
+                        w.writerow(r)
+                print(f"[data-audit] wrote {csv_path}")
+
 
 
 class EnsureMinSNRCallback(Callback):

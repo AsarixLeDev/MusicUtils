@@ -1,0 +1,69 @@
+# ======================================================================
+# Evaluation / inference config
+# Works with the upcoming scripts/eval_denoiser.py and tools/infer_batch.py
+# ======================================================================
+
+paths:
+  runs_root: runs
+  run_name: denoiser_music_eval
+
+data:
+  # Use the full validation set (stems or mixtures)
+  val_manifest: manifests/music_stems_val.jsonl
+  sr: 48000
+  crop: 0.0        # no cropping in eval (0 → use full clip where supported)
+  mono: true
+
+  batch: 4
+  workers: 4
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+
+  # For audit-only tools; ignored by eval scripts if not needed
+  snr_min: 0.0
+  snr_max: 20.0
+  use_ext_noise_p: 0.0
+  p_clean: 1.0
+  out_peak: 0.98
+
+model:
+  name: complex_unet_auto
+  args:
+    base: 56
+
+task:
+  name: denoise_stft
+  args:
+    mask_variant: mag_sigmoid
+    mask_floor: 0.30
+    mask_limit: 1.60
+    clamp_mask_tanh: 0.0
+    safe_unity_fallback: true
+
+# Losses are not used for scoring in eval; metrics below will be logged.
+losses:
+  items:
+    - { name: l1_wave, weight: 0.0 }   # placeholder; ignored by eval scripts
+
+# Which checkpoint to load for evaluation (path or pattern).
+eval:
+  checkpoint: "runs/**/checkpoints/epoch_*.pt"    # choose latest by default
+  save_audio: true                                # write yhat WAVs alongside CSV results
+  save_dir: "eval_outputs"                        # will be created under runs_root/run_name
+
+metrics:
+  # (future) The eval script will compute these with positive, human-readable scales
+  # and write a CSV: per-file + global summary.
+  requested: [ "sisdr", "lsd", "mrstft", "composite" ]
+  # optional thresholding for pass/fail gates
+  gates:
+    composite_max: 0.50   # example: composite score (lower is better) must be <= 0.5
+
+callbacks: {}
+
+runtime:
+  amp: float32
+  channels_last: true
+  compile: false
+  cuda_prefetch: true

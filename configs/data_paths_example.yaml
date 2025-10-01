@@ -1,0 +1,36 @@
+# ======================================================================
+# Example path configuration (edit to your filesystem)
+# Used by the manifest builder tools we’ll add next.
+# ======================================================================
+
+musdb_hq:
+  root: "./soundrestorer/data/extracted/stems/musdb18hq"          # or "/data/musdbhq/"
+  train_split: "train"
+  val_split: "valid"                      # or "test" if you prefer
+
+moises:
+  root: "./soundrestorer/data/extracted/stems/moisesdb_v0.1"             # or "/data/moises/"
+  pattern_mix: "**/mixture/mixture.wav"
+
+  pattern_stems:
+    - "**/vocals/*.wav"
+    - "**/bass/*.wav"
+    - "**/drums/*.wav"
+    - "**/guitar/*.wav"
+    - "**/other/*.wav"
+    - "**/other_keys/*.wav"
+
+musan:
+  root: "./soundrestorer/data/extracted/noise/musan"              # or "/data/musan/"
+  subsets: ["noise", "music", "speech"]   # we’ll filter with noise_filters.yaml
+
+demand:
+  root: "./soundrestorer/data/extracted/noise/demand"             # or "/data/demand/"
+
+manifests_out:
+  dir: "manifests/"
+  # Output filenames the builder tools will generate:
+  music_stems_train: "music_stems_train.jsonl"
+  music_stems_val:   "music_stems_val.jsonl"
+  musan_filtered:    "musan_musicnoise.jsonl"
+  demand_all:        "demand.jsonl"

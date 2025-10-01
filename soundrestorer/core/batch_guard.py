@@ -2,24 +2,7 @@ from __future__ import annotations
 import torch, math, statistics
 from collections import deque
 from typing import Tuple, Optional
-
-def _bt(x: torch.Tensor) -> torch.Tensor:
-    if x.dim() == 1: return x.unsqueeze(0)
-    if x.dim() == 2: return x
-    if x.dim() == 3: return x.mean(dim=1)
-    raise RuntimeError(f"expected 1/2/3D audio, got {tuple(x.shape)}")
-
-@torch.no_grad()
-def si_sdr_db(y: torch.Tensor, x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    y = _bt(y); x = _bt(x)
-    xz = x - x.mean(dim=-1, keepdim=True)
-    yz = y - y.mean(dim=-1, keepdim=True)
-    s = (torch.sum(yz * xz, dim=-1, keepdim=True) /
-         (torch.sum(xz * xz, dim=-1, keepdim=True) + eps)) * xz
-    e = yz - s
-    num = torch.sum(s**2, dim=-1)
-    den = torch.sum(e**2, dim=-1) + eps
-    return 10.0 * torch.log10(num / den + eps)
+from ..utils.metrics import si_sdr_db, _bt
 
 class BatchGuard:
     """

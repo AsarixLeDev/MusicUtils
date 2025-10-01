@@ -8,24 +8,6 @@ def param_counts(model: torch.nn.Module) -> Dict[str, int]:
     train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return {"total": total, "trainable": train, "frozen": total - train}
 
-@torch.no_grad()
-def si_sdr_db(y: torch.Tensor, x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    # (B,T) | (B,1,T) | (B,C,T) supported → (B,T)
-    def _bt(t):
-        if t.dim() == 1: return t.unsqueeze(0)
-        if t.dim() == 2: return t
-        if t.dim() == 3: return t.mean(dim=1)
-        raise RuntimeError(f"si_sdr_db expects 1/2/3D, got {tuple(t.shape)}")
-    y = _bt(y); x = _bt(x)
-    xz = x - x.mean(dim=-1, keepdim=True)
-    yz = y - y.mean(dim=-1, keepdim=True)
-    s = (torch.sum(yz * xz, dim=-1, keepdim=True) /
-         (torch.sum(xz * xz, dim=-1, keepdim=True) + eps)) * xz
-    e = yz - s
-    num = torch.sum(s ** 2, dim=-1)
-    den = torch.sum(e ** 2, dim=-1) + eps
-    return 10.0 * torch.log10(num / den + eps)  # (B,)
-
 def fmt_compact_comps(d: dict, order=("mrstft","mel_l1","l1_wave","phase_cosine","highband_l1","sisdr_ratio","energy_anchor")):
     parts = []
     for k in order:

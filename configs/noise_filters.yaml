@@ -1,0 +1,57 @@
+# ======================================================================
+# Declarative filters for external noise corpora (MUSAN, DEMAND)
+# The mixer will consult these to choose realistic music/speech-compatible noises.
+# ======================================================================
+
+version: 1
+
+# Allowed broad classes for music denoising context
+include_labels:
+  # ambient / room / stage
+  - room_tone
+  - hvac
+  - fan
+  - ventilation
+  - light_rain
+  - distant_thunder
+  - light_traffic_road
+  - light_wind
+  - audience_murmur
+  - applause_light
+  - small_crowd
+  - cafe_ambience
+  - studio_rustle
+  - chair_creak
+  - mic_handling
+  - cable_rustle
+  - vinyl_crackle
+  - tape_hiss
+
+# Noises we explicitly do NOT want (too rare or distracting in music)
+exclude_labels:
+  - siren
+  - gunshot
+  - explosion
+  - baby_cry
+  - alarm
+  - phone_ring
+  - keyboard_loud
+  - door_slam
+  - dog_bark
+  - bird_chirp_close
+  - speech_foreground    # avoid strong interfering speech for music use-case
+
+# Basic audio constraints applied after label filtering
+constraints:
+  min_dur_s: 0.8
+  max_dur_s: 30.0
+  rms_dbfs_range: [-45, -10]        # keep reasonable loudness for mixing
+  bandpass_hz: [40, 16000]          # pre-filter to musical bandwidth
+  max_clip_ratio: 0.01              # avoid heavily clipped noise segments
+
+# SNR sampling preferences (used by the mixer; still bounded by data.snr_min/max)
+snr_sampling:
+  strategy: "triangular"            # triangular favors mid SNRs
+  low_db: 0.0
+  mode_db: 8.0
+  high_db: 20.0

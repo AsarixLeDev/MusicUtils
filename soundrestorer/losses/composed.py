@@ -1,37 +1,47 @@
+# soundrestorer/losses/composed.py
+from __future__ import annotations
 from typing import Dict, Any, List, Tuple
-import torch
-from .base import LossModule
-from ..core.registry import LOSSES
+import torch, torch.nn as nn
 
-class ComposedLoss:
-    """
-    Build from config:
-      losses:
-        items:
-          - {name: mrstft, weight: 1.0}
-          - {name: l1_wave, weight: 0.5}
-          - {name: sisdr_ratio, weight: 0.35, args: {min_db: 10}}
-          ...
-    """
-    def __init__(self, items: List[Dict[str,Any]]):
-        self.items = []
+from .mrstft import MRSTFTLoss
+from .l1_wave import L1WaveLoss
+from .sisdr_pos import SISDRPositiveLoss  # adjust name if your file defines a different class
+try:
+    from .mask_unity_reg import MaskUnityReg
+except Exception:
+    MaskUnityReg = None
+
+REG = {
+    "mrstft": MRSTFTLoss,
+    "l1_wave": L1WaveLoss,
+    "sisdr_pos": SISDRPositiveLoss,
+}
+if MaskUnityReg is not None:
+    REG["mask_unity_reg"] = MaskUnityReg
+
+class ComposedLoss(nn.Module):
+    def __init__(self, items: List[Dict[str, Any]]):
+        super().__init__()
+        self.entries = nn.ModuleList()
+        self.weights = []
         for it in items:
-            name = it["name"]; w = float(it.get("weight", 1.0)); args = it.get("args", {})
-            loss_fn: LossModule = LOSSES.build(name, **args)
-            self.items.append((name, w, loss_fn))
+            name = it["name"]
+            cls = REG[name]
+            self.entries.append(cls(**(it.get("args") or {})))
+            self.weights.append(float(it.get("weight", 1.0)))
+    def forward(self, outputs, batch) -> Tuple[torch.Tensor, Dict[str, float]]:
+        total = torch.zeros((), device=outputs["yhat"].device, dtype=outputs["yhat"].dtype)
+        comps = {}
+        for w, loss in zip(self.weights, self.entries):
+            val = loss(outputs, batch)
+            if isinstance(val, tuple):
+                v, _ = val
+            else:
+                v = val
+            total = total + w * v
+        comps["total"] = float(total.detach().cpu())
+        return total, comps
 
-    def __call__(self, outputs: Dict[str, torch.Tensor], batch) -> Tuple[torch.Tensor, Dict[str, float]]:
-        tot = 0.0; comps = {}
-        for name, w, fn in self.items:
-            v = fn(outputs, batch)
-            if not torch.is_tensor(v): v = torch.as_tensor(v, device=outputs["yhat"].device)
-            tot = tot + w * v
-            comps[name] = float(v.detach().item())
-        return tot, comps
-
-    def set_attr(self, loss_name: str, attr: str, value) -> bool:
-        for name, _, fn in self.items:
-            if name == loss_name and hasattr(fn, attr):
-                setattr(fn, attr, value)
-                return True
-        return False
+def build_losses(cfg: Dict[str, Any]) -> nn.Module:
+    items = (cfg.get("losses") or {}).get("items", [])
+    return ComposedLoss(items)

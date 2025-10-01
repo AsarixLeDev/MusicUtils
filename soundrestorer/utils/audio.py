@@ -1,192 +1,124 @@
+# -*- coding: utf-8 -*-
+# soundrestorer/utils/audio.py
 from __future__ import annotations
+from typing import List, Sequence, Tuple, Optional
 import torch
 
-def hann_window(n_fft, device, dtype=torch.float32):
-    # sqrt-Hann for COLA
-    w = torch.hann_window(n_fft, periodic=True, device=device, dtype=dtype if dtype is not None else torch.float32)
-    return torch.sqrt(torch.clamp(w, min=0)).to(dtype or torch.float32)
-
-def _as_batch_mono(x: torch.Tensor) -> torch.Tensor:
-    if x.dim() == 1: return x.unsqueeze(0)
-    if x.dim() == 2: return x
-    if x.dim() == 3: return x.mean(dim=1)
-    raise RuntimeError(f"Expected 1D/2D/3D waveform, got shape {tuple(x.shape)}")
-
-
-@torch.no_grad()
-def sisdr_improvement_db(
-    yhat: torch.Tensor,
-    noisy: torch.Tensor,
-    clean: torch.Tensor,
-    eps: float = 1e-8,
-    trim_frac: float = 0.0,
-) -> torch.Tensor:
+def ensure_3d(x: torch.Tensor) -> torch.Tensor:
     """
-    Mean (or trimmed mean) SI-SDR improvement in dB across the batch.
+    Ensure a waveform tensor is [B, C, T].
+    Accepts [T], [C, T], [B, C, T]. Returns a view/clone on same device/dtype.
     """
-    si_n = si_sdr_db(noisy, clean, eps=eps)      # (B,)
-    si_r = si_sdr_db(yhat,  clean, eps=eps)      # (B,)
-    d = si_r - si_n                               # (B,)
+    if x.dim() == 1:
+        return x.view(1, 1, -1)
+    if x.dim() == 2:
+        # [C, T] -> [1, C, T]
+        return x.unsqueeze(0)
+    if x.dim() == 3:
+        return x
+    raise ValueError(f"ensure_3d: expected 1/2/3 dims, got {x.shape}")
 
-    if trim_frac <= 0:
-        return d.mean()
-
-    k = int(d.numel() * trim_frac)
-    if k <= 0:
-        return d.mean()
-    d_sorted, _ = torch.sort(d)
-    core = d_sorted[k: d_sorted.numel() - k]
-    if core.numel() == 0:
-        core = d_sorted
-    return core.mean()
-
-@torch.no_grad()
-def si_sdr_db(
-    y: torch.Tensor,
-    x: torch.Tensor,
-    eps: float = 1e-8,
-    zero_mean: bool = True,
-    clamp_db_min: float | None = -60.0,
-    match_length: bool = True,
-    debug_shapes: int = 0,         # <— NEW: log shapes for first N calls
-) -> torch.Tensor:
+def to_mono(x: torch.Tensor, keepdim: bool = True) -> torch.Tensor:
     """
-    Robust scale-invariant SDR in dB, with optional one-shot shape logging.
-
-    Accepts (B,T) or (B,C,T) (and (T)/(C,T), auto-batched).
-    If either has channels, BOTH are downmixed to mono to avoid broadcasting.
-    If match_length=True, trims both to min length.
+    Mix down channels by mean across C. Works with [T], [C, T], [B, C, T].
+    Returns [B, 1, T] if keepdim else [B, T].
     """
-    # -------- tiny helper to print once/few times --------
-    # Reduce noise: only print for the first `debug_shapes` invocations (per process)
-    if not hasattr(si_sdr_db, "_dbg_count"):
-        si_sdr_db._dbg_count = 0
+    x3 = ensure_3d(x)
+    m = x3.mean(dim=1, keepdim=True)  # [B, 1, T]
+    if keepdim:
+        return m
+    return m.squeeze(1)
 
-    def _pfx(ok: bool) -> str:
-        return "[si_sdr_db]" if ok else "[si_sdr_db:WARN]"
+def peak(x: torch.Tensor, dim: Sequence[int] = (-1,), keepdim: bool = False) -> torch.Tensor:
+    xabs = x.abs()
+    for d in sorted([d if d >= 0 else xabs.dim() + d for d in dim], reverse=True):
+        xabs, _ = xabs.max(dim=d, keepdim=True)
+    return xabs if keepdim else xabs.squeeze(dim)
 
-    def _stats(name: str, t: torch.Tensor) -> str:
-        t32 = t.detach()
-        m = float(t32.mean()) if t32.numel() else 0.0
-        s = float(t32.std())  if t32.numel() else 0.0
-        fin = bool(torch.isfinite(t32).all())
-        return f"{name}: shape={tuple(t.shape)}, dtype={t.dtype}, dev={t.device}, mean={m:.3e}, std={s:.3e}, finite={fin}"
+def normalize_peak(x: torch.Tensor, target: float = 0.98, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Scale per-sample to a target peak in [-target, target].
+    Works for [T], [C,T], [B,C,T] (normalized independently per item in batch).
+    """
+    x3 = ensure_3d(x)
+    p = peak(x3, dim=(-1,), keepdim=True)  # [B, C, 1] peak per chan
+    s = (target / (p + eps))
+    s = torch.clamp(s, max=1e4)
+    y = x3 * s
+    return y if x.dim() == 3 else y.squeeze(0) if x.dim() == 2 else y.view(-1)
 
-    log_now = si_sdr_db._dbg_count < int(debug_shapes)
+def pad_or_trim(x: torch.Tensor, target_len: int, align: str = "left") -> torch.Tensor:
+    """
+    Pad (zeros) or trim along time to exactly `target_len`.
+    align: 'left' (keep beginning), 'center', or 'right' (keep ending) when trimming.
+    """
+    x3 = ensure_3d(x)
+    B, C, T = x3.shape
+    if T == target_len:
+        return x
+    if T < target_len:
+        pad = target_len - T
+        pad_left = 0
+        pad_right = pad
+        return torch.nn.functional.pad(x3, (0, pad_right), mode="constant", value=0.0) \
+            if x.dim() == 3 else pad_or_trim(x3, target_len, align)
+    # Trim
+    if align == "center":
+        start = max(0, (T - target_len) // 2)
+    elif align == "right":
+        start = max(0, T - target_len)
+    else:
+        start = 0
+    return x3[..., start:start + target_len] if x.dim() == 3 else x3[..., start:start + target_len].squeeze(0)
 
-    # --- normalize shapes to (B,T) ---
-    def _to_bt(t: torch.Tensor) -> torch.Tensor:
-        if t.dim() == 1:  return t.unsqueeze(0)
-        if t.dim() == 2:  return t
-        if t.dim() == 3:  return t.mean(dim=1)
-        raise RuntimeError(f"Unexpected tensor shape {tuple(t.shape)} for SI-SDR")
+def match_length(a: torch.Tensor, b: torch.Tensor, align: str = "left") -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Make two waveforms the same length by padding/trimming the *second* to the first.
+    """
+    a3 = ensure_3d(a); b3 = ensure_3d(b)
+    Ta, Tb = a3.shape[-1], b3.shape[-1]
+    if Ta == Tb:
+        return a, b
+    return a, pad_or_trim(b, target_len=Ta, align=align)
 
-    y0, x0 = y, x  # keep originals for debug prints
-    y = _to_bt(y); x = _to_bt(x)
+def random_time_crop_pair(
+    xs: List[torch.Tensor], crop_samples: int, rng: Optional[torch.Generator] = None
+) -> List[torch.Tensor]:
+    """
+    Take the same random crop across a list of aligned signals. Inputs can be [T]/[C,T]/[B,C,T].
+    """
+    xs3 = [ensure_3d(x) for x in xs]
+    T = min(x.shape[-1] for x in xs3)
+    if crop_samples >= T:
+        return [pad_or_trim(x, crop_samples) for x in xs3]
+    g = rng if rng is not None else torch.Generator(device=xs3[0].device)
+    start = int(torch.randint(0, T - crop_samples + 1, (1,), generator=g).item())
+    return [x[..., start:start + crop_samples] for x in xs3]
 
-    # --- optional length alignment ---
-    if match_length:
-        T = min(y.shape[-1], x.shape[-1])
-        if y.shape[-1] != T: y = y[..., :T]
-        if x.shape[-1] != T: x = x[..., :T]
+def random_gain_db(x: torch.Tensor, min_db: float = -3.0, max_db: float = +3.0,
+                   per_channel: bool = False, rng: Optional[torch.Generator] = None) -> torch.Tensor:
+    """
+    Apply random gain in dB. Uniform in [min_db, max_db].
+    """
+    x3 = ensure_3d(x)
+    B, C, T = x3.shape
+    g = rng if rng is not None else torch.Generator(device=x3.device)
+    if per_channel:
+        gains = (min_db + (max_db - min_db) * torch.rand((B, C, 1), generator=g, device=x3.device, dtype=x3.dtype))
+    else:
+        gains = (min_db + (max_db - min_db) * torch.rand((B, 1, 1), generator=g, device=x3.device, dtype=x3.dtype))
+    scale = (10.0 ** (gains / 20.0))
+    y = x3 * scale
+    return y if x.dim() == 3 else y.squeeze(0) if x.dim() == 2 else y.view(-1)
 
-    if zero_mean:
-        y = y - y.mean(dim=-1, keepdim=True)
-        x = x - x.mean(dim=-1, keepdim=True)
-
-    if log_now:
-        print(_pfx(True), "INPUTS")
-        print(" ", _stats("y_in", y0))
-        print(" ", _stats("x_in", x0))
-        print(_pfx(True), "NORMALIZED")
-        print(" ", _stats("y_bt", y))
-        print(" ", _stats("x_bt", x))
-        si_sdr_db._dbg_count += 1
-
-    # basic sanity checks
-    assert y.shape[:2] == x.shape[:2], f"Batch/length mismatch after normalization: y{y.shape} vs x{x.shape}"
-
-    # --- projection ---
-    xx = torch.sum(x * x, dim=-1, keepdim=True).clamp_min(eps)
-    scale = torch.sum(y * x, dim=-1, keepdim=True) / xx
-    s = scale * x
-    e = y - s
-
-    num = torch.sum(s * s, dim=-1).clamp_min(eps)
-    den = torch.sum(e * e, dim=-1).clamp_min(eps)
-    sisdr = 10.0 * torch.log10(num / den)
-
-    if clamp_db_min is not None:
-        floor = torch.tensor(clamp_db_min, device=sisdr.device, dtype=sisdr.dtype)
-        sisdr = torch.maximum(sisdr, floor)
-
-    bad = ~torch.isfinite(sisdr)
-    if bad.any():
-        fill = torch.tensor(clamp_db_min if clamp_db_min is not None else -60.0,
-                            device=sisdr.device, dtype=sisdr.dtype)
-        sisdr = sisdr.masked_fill(bad, fill)
-
-    if log_now:
-        print(_pfx(True), f"SI-SDR batch={tuple(sisdr.shape)} mean={float(sisdr.mean()):.2f} dB (min={float(sisdr.min()):.2f}, max={float(sisdr.max()):.2f})")
-
-    return sisdr
-
-
-
-def stft_any(x: torch.Tensor, n_fft: int, hop: int, win: torch.Tensor) -> torch.Tensor:
-    x = _as_batch_mono(x)
-    win = win.contiguous().to(dtype=torch.float32, device=x.device)
-    device_type = "cuda" if x.is_cuda else "cpu"
-    with torch.autocast(device_type=device_type, dtype=torch.float32, enabled=False):
-        X = torch.stft(x.float(), n_fft=n_fft, hop_length=hop, win_length=n_fft,
-                       window=win, center=True, return_complex=True, normalized=False)
-    return X  # (B,F,T) complex
-
-def stft_pair(wave: torch.Tensor, win: torch.Tensor, n_fft: int, hop: int):
-    X = stft_any(wave, n_fft, hop, win)
-    Xri = torch.stack([X.real, X.imag], dim=1).contiguous()  # (B,2,F,T)
-    return X, Xri
-
-def istft_from(X: torch.Tensor, win: torch.Tensor, length: int, n_fft: int, hop: int):
-    win = win.contiguous().to(dtype=torch.float32, device=X.device)
-    device_type = "cuda" if X.is_cuda else "cpu"
-    with torch.autocast(device_type=device_type, dtype=torch.float32, enabled=False):
-        X = X.to(torch.complex64)
-        y = torch.istft(X, n_fft=n_fft, hop_length=hop, win_length=n_fft,
-                        window=win, center=True, length=length, normalized=False)
-    return y  # (B,T)
-
-# ---- extra pieces used by losses ----
-def _hz_to_mel(f):  # HTK
-    return 2595.0 * torch.log10(1.0 + f / 700.0)
-
-def _mel_to_hz(m):
-    return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
-
-def mel_filterbank(sr: int, n_fft: int, n_mels: int, fmin: float = 0.0, fmax: float | None = None, device=None):
-    fmax = float(sr) / 2.0 if fmax is None else float(fmax)
-    m_min, m_max = _hz_to_mel(torch.tensor(fmin)), _hz_to_mel(torch.tensor(fmax))
-    m_pts = torch.linspace(m_min, m_max, n_mels + 2)
-    f_pts = _mel_to_hz(m_pts)
-    bins = torch.floor((n_fft + 1) * f_pts / float(sr)).long()
-    fb = torch.zeros(n_mels, n_fft // 2 + 1)
-    for i in range(n_mels):
-        left, center, right = bins[i], bins[i + 1], bins[i + 2]
-        if center > left:
-            fb[i, left: center] = torch.linspace(0, 1, center - left)
-        if right > center:
-            fb[i, center: right] = torch.linspace(1, 0, right - center)
-    return fb.to(device=device, dtype=torch.float32)
-
-def stft_phase_cosine(y: torch.Tensor, x: torch.Tensor, win: torch.Tensor, n_fft: int, hop: int,
-                      eps: float = 1e-8, mag_weight: bool = True) -> torch.Tensor:
-    Y = stft_any(y, n_fft, hop, win)
-    X = stft_any(x, n_fft, hop, win)
-    Yr, Yi = Y.real, Y.imag; Xr, Xi = X.real, X.imag
-    dot = Yr * Xr + Yi * Xi
-    denom = (Y.abs() * X.abs() + eps)
-    cos_dphi = dot / denom
-    if mag_weight:
-        w = X.abs()
-        return (w * (1.0 - cos_dphi)).sum() / (w.sum() + eps)
-    return (1.0 - cos_dphi).mean()
+def is_silent(x: torch.Tensor, threshold_db: float = -60.0, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Returns a boolean mask per-item (shape [B, 1] for [B,C,T], or scalar for single item)
+    indicating RMS dB < threshold_db.
+    """
+    from .metrics import rms_db
+    x3 = ensure_3d(x)
+    # RMS over time and channels jointly
+    r_db = rms_db(x3, dim=(-1, -2), keepdim=True)  # [B,1,1]
+    silent = (r_db < threshold_db)
+    return silent.squeeze(-1)  # [B,1]

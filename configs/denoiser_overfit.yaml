@@ -1,0 +1,87 @@
+paths:
+  runs_root: runs
+  run_name: overfit
+
+data:
+  train_manifest: soundrestorer/data/training/train.jsonl
+  val_manifest:   soundrestorer/data/training/val.jsonl
+  sr: 48000
+  crop: 3.0
+  mono: true
+  batch: 1
+  workers: 0
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: false
+
+model:
+  name: complex_unet_auto
+  args:
+    base: 48
+
+task:
+  name: denoise_stft
+  args:
+    mask_variant: mag_sigmoid
+    mask_floor: 0.92          # conservative bounds for stability
+    mask_limit: 1.08
+    clamp_mask_tanh: 0.0
+    safe_unity_fallback: true
+    n_fft: 1024
+    hop: 256
+
+losses:
+  items:
+    - {name: mrstft,  weight: 0.70, args: {fft_sizes: [1024,2048], hops: [256,512], win_lengths: [1024,2048]}}
+    - {name: l1_wave, weight: 0.75}
+    - {name: sisdr,   weight: 0.50}   # the plain SI-SDR loss you added
+
+optim:
+  lr: 1.0e-3
+  wd: 0.0
+  grad_clip: 0.0
+  grad_accum: 1
+  warmup_steps: 0
+  lr_min_factor: 1.0
+
+train:
+  epochs: 1
+  save_every: 1
+  ema: 0.0
+
+callbacks:
+  curriculum:
+    enable: true
+    mask_limit: {start: 1.00, end: 1.15, end_epoch: 6}
+  proc_noise:
+    enable: true
+    prob: 0.6           # blended with dataset noise
+    snr_min: 0.0
+    snr_max: 20.0
+
+  ensure_min_snr:
+    enable: true
+    min_snr_db: 25.0    # rescue too-clean train items
+    snr_min: 4.0
+    snr_max: 20.0
+    train_only: true
+hard_mining: { enable: false }
+
+debug:
+  overfit_steps: 600
+  val_every: 1
+  val_max_batches: 8
+  sisdr_ignore_if_noisy_gt_db: 25.0
+  sisdr_probe_max_batches: 9999
+  pbar_every: 8
+  print_comp: true
+  overfit_scan_batches: 32   # new
+
+
+runtime:
+  amp: float32
+  channels_last: true
+  cuda_graph: false
+  compile: false
+  cuda_prefetch: true
+  warmup_batches: 0

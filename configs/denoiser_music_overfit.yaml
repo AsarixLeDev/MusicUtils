@@ -1,0 +1,87 @@
+# ======================================================================
+# Micro overfit sanity config (1 batch, converges quickly)
+# Verifies: data pathing, gradient flow, mask semantics, positive losses
+# ======================================================================
+
+paths:
+  runs_root: runs
+  run_name: denoiser_music_overfit
+
+data:
+  train_manifest: manifests/music_stems_train_small.jsonl   # a tiny subset (e.g., 10–20 items)
+  val_manifest:   manifests/music_stems_val_small.jsonl
+
+  sr: 48000
+  crop: 3.0
+  mono: true
+
+  batch: 1
+  workers: 0
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: false
+
+  snr_min: 3.0
+  snr_max: 6.0
+  use_ext_noise_p: 1.0
+  p_clean: 0.0
+  out_peak: 0.98
+
+  target: mixture
+  allowed_stems: [vocals, drums, bass, other]
+
+model:
+  name: complex_unet_auto
+  args:
+    base: 48
+
+task:
+  name: denoise_stft
+  args:
+    mask_variant: mag_sigmoid
+    mask_floor: 0.30
+    mask_limit: 1.80
+    clamp_mask_tanh: 0.0
+    safe_unity_fallback: true
+
+losses:
+  items:
+    - { name: mrstft,  weight: 0.02,
+        args: { fft_sizes: [1024, 2048], hops: [256, 512], win_lengths: [1024, 2048] } }
+    - { name: l1_wave, weight: 1.00 }
+    # keep positive-only to make “tends to 0” obvious in this sanity pass
+
+optim:
+  lr: 1.0e-3
+  wd: 0.0
+  grad_clip: 0.0
+  grad_accum: 1
+  warmup_steps: 0
+  lr_min_factor: 1.0
+
+train:
+  epochs: 1
+  save_every: 1
+  ema: 0.0
+
+callbacks: {}
+
+hard_mining: { enable: false }
+
+debug:
+  overfit_steps: 600
+  val_every: 1
+  val_max_batches: 2
+  sisdr_ignore_if_noisy_gt_db: 25.0
+  sisdr_probe_max_batches: 0
+  pbar_every: 8
+  print_comp: true
+  overfit_scan_batches: 32
+
+runtime:
+  amp: float32
+  channels_last: true
+  cuda_graph: false
+  compile: false
+  cuda_prefetch: true
+  warmup_batches: 0
