@@ -1,18 +1,25 @@
 # soundrestorer/core/loader.py
 from __future__ import annotations
-import os, math, random
-import torch, numpy as np
+
+import os
+import random
+
+import numpy as np
+import torch
+
 
 def seed_worker(worker_id: int):
     # Different RNG stream per worker & epoch
-    worker_seed = (torch.initial_seed() + worker_id) % 2**32
+    worker_seed = (torch.initial_seed() + worker_id) % 2 ** 32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+
 
 def make_generator(seed: int | None = None) -> torch.Generator:
     g = torch.Generator()
     g.manual_seed(seed if seed is not None else torch.seed())
     return g
+
 
 def default_loader_args(num_items: int, batch_size: int, workers_cfg: int | None = None):
     # Sensible defaults for Windows/NVMe: a few workers, deeper prefetch

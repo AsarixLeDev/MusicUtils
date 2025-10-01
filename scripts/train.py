@@ -27,7 +27,7 @@ from soundrestorer.data.builder import build_loaders  # returns (train_loader, v
 
 # ADD (safe import; ignore if missing)
 try:
-    from soundrestorer.core.callbacks import ProcNoiseAugmentCallback
+    from soundrestorer.callbacks.proc_noise_augment import ProcNoiseAugmentCallback
 except Exception:
     ProcNoiseAugmentCallback = None
 
@@ -174,6 +174,19 @@ def main():
             write_wavs=bool(p.get("write_wavs", True)),
             write_csv=bool(p.get("write_csv", True)),
         ))
+
+    if ProcNoiseAugmentCallback is not None and cb_cfg.get("proc_noise", {}).get("enable", False):
+        pn = cb_cfg["proc_noise"]
+        cbs.append(ProcNoiseAugmentCallback(
+            sr=int(cfg["data"]["sr"]),
+            prob=float(pn.get("prob", 0.5)),
+            snr_min=float(pn.get("snr_min", 0.0)),
+            snr_max=float(pn.get("snr_max", 20.0)),
+            out_peak=float(cfg["data"].get("out_peak", 0.98)),
+            train_only=True,
+            noise_cfg=pn.get("noise_cfg", {})
+        ))
+        print("[callbacks] ProcNoiseAugmentCallback enabled")
 
     # -----------------------
     # Trainer

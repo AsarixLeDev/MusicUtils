@@ -1,6 +1,8 @@
 # soundrestorer/models/init_utils.py
 from __future__ import annotations
+
 import math
+
 import torch
 import torch.nn as nn
 
@@ -18,10 +20,10 @@ def _find_mask_head_conv(model: nn.Module) -> nn.Conv2d | None:
 
 
 def init_head_for_mask(
-    model: nn.Module,
-    mask_variant: str = "plain",
-    mask_floor: float | None = None,
-    mask_limit: float | None = None,
+        model: nn.Module,
+        mask_variant: str = "plain",
+        mask_floor: float | None = None,
+        mask_limit: float | None = None,
 ) -> bool:
     """
     Initialize the denoiser head so the *applied* mask starts at UNITY.

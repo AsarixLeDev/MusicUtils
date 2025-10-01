@@ -12,6 +12,7 @@ LOSS_REGISTRY = {
     "sisdr_ratio": SISDRPositiveLoss,  # same objective (error ratio)
 }
 
+
 def build_loss(name: str, args=None):
     if name not in LOSS_REGISTRY:
         raise KeyError(f"Unknown loss name: {name}. Available: {list(LOSS_REGISTRY.keys())}")

@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 # soundrestorer/utils/audio.py
 from __future__ import annotations
+
 from typing import List, Sequence, Tuple, Optional
+
 import torch
+
 
 def ensure_3d(x: torch.Tensor) -> torch.Tensor:
     """
@@ -18,6 +21,7 @@ def ensure_3d(x: torch.Tensor) -> torch.Tensor:
         return x
     raise ValueError(f"ensure_3d: expected 1/2/3 dims, got {x.shape}")
 
+
 def to_mono(x: torch.Tensor, keepdim: bool = True) -> torch.Tensor:
     """
     Mix down channels by mean across C. Works with [T], [C, T], [B, C, T].
@@ -29,11 +33,13 @@ def to_mono(x: torch.Tensor, keepdim: bool = True) -> torch.Tensor:
         return m
     return m.squeeze(1)
 
+
 def peak(x: torch.Tensor, dim: Sequence[int] = (-1,), keepdim: bool = False) -> torch.Tensor:
     xabs = x.abs()
     for d in sorted([d if d >= 0 else xabs.dim() + d for d in dim], reverse=True):
         xabs, _ = xabs.max(dim=d, keepdim=True)
     return xabs if keepdim else xabs.squeeze(dim)
+
 
 def normalize_peak(x: torch.Tensor, target: float = 0.98, eps: float = 1e-8) -> torch.Tensor:
     """
@@ -46,6 +52,7 @@ def normalize_peak(x: torch.Tensor, target: float = 0.98, eps: float = 1e-8) -> 
     s = torch.clamp(s, max=1e4)
     y = x3 * s
     return y if x.dim() == 3 else y.squeeze(0) if x.dim() == 2 else y.view(-1)
+
 
 def pad_or_trim(x: torch.Tensor, target_len: int, align: str = "left") -> torch.Tensor:
     """
@@ -71,18 +78,21 @@ def pad_or_trim(x: torch.Tensor, target_len: int, align: str = "left") -> torch.
         start = 0
     return x3[..., start:start + target_len] if x.dim() == 3 else x3[..., start:start + target_len].squeeze(0)
 
+
 def match_length(a: torch.Tensor, b: torch.Tensor, align: str = "left") -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Make two waveforms the same length by padding/trimming the *second* to the first.
     """
-    a3 = ensure_3d(a); b3 = ensure_3d(b)
+    a3 = ensure_3d(a);
+    b3 = ensure_3d(b)
     Ta, Tb = a3.shape[-1], b3.shape[-1]
     if Ta == Tb:
         return a, b
     return a, pad_or_trim(b, target_len=Ta, align=align)
 
+
 def random_time_crop_pair(
-    xs: List[torch.Tensor], crop_samples: int, rng: Optional[torch.Generator] = None
+        xs: List[torch.Tensor], crop_samples: int, rng: Optional[torch.Generator] = None
 ) -> List[torch.Tensor]:
     """
     Take the same random crop across a list of aligned signals. Inputs can be [T]/[C,T]/[B,C,T].
@@ -94,6 +104,7 @@ def random_time_crop_pair(
     g = rng if rng is not None else torch.Generator(device=xs3[0].device)
     start = int(torch.randint(0, T - crop_samples + 1, (1,), generator=g).item())
     return [x[..., start:start + crop_samples] for x in xs3]
+
 
 def random_gain_db(x: torch.Tensor, min_db: float = -3.0, max_db: float = +3.0,
                    per_channel: bool = False, rng: Optional[torch.Generator] = None) -> torch.Tensor:
@@ -110,6 +121,7 @@ def random_gain_db(x: torch.Tensor, min_db: float = -3.0, max_db: float = +3.0,
     scale = (10.0 ** (gains / 20.0))
     y = x3 * scale
     return y if x.dim() == 3 else y.squeeze(0) if x.dim() == 2 else y.view(-1)
+
 
 def is_silent(x: torch.Tensor, threshold_db: float = -60.0, eps: float = 1e-8) -> torch.Tensor:
     """

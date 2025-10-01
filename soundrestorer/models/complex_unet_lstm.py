@@ -1,6 +1,9 @@
-import torch, torch.nn as nn
-from ..core.registry import MODELS
+import torch
+import torch.nn as nn
+
 from soundrestorer.models.denoiser_net import ComplexUNet as _ComplexUNet
+from ..core.registry import MODELS
+
 
 @MODELS.register("complex_unet_lstm")
 class ComplexUNetLSTM(nn.Module):
@@ -32,15 +35,14 @@ class ComplexUNetLSTM(nn.Module):
         self._built = True
 
     def forward(self, Xri):  # (B,2,F,T)
-        M = self.net(Xri)                # (B,2,F,T), fp32
+        M = self.net(Xri)  # (B,2,F,T), fp32
         B, C, F, T = M.shape
         if not self._built:
             self._build_once(F, ref_device=M.device)
 
         # (B,2,F,T) -> (B,T,2F)
-        z = M.permute(0, 3, 1, 2).contiguous().view(B, T, 2*F)
-        z, _ = self.rnn(z)               # (B,T,H*dir)
-        z = self.proj(z)                 # (B,T,2F)
+        z = M.permute(0, 3, 1, 2).contiguous().view(B, T, 2 * F)
+        z, _ = self.rnn(z)  # (B,T,H*dir)
+        z = self.proj(z)  # (B,T,2F)
         z = z.view(B, T, 2, F).permute(0, 2, 3, 1).contiguous()  # (B,2,F,T)
         return z
-

@@ -1,6 +1,8 @@
 # soundrestorer/core/cudagraphs.py
 from __future__ import annotations
+
 import torch
+
 
 class GraphStep:
     """
@@ -10,6 +12,7 @@ class GraphStep:
       - grad_accum == 1
       - no GradScaler (bf16 AMP is fine)
     """
+
     def __init__(self, trainer, first_batch):
         self.tr = trainer
         self.dev = trainer.device
@@ -44,7 +47,8 @@ class GraphStep:
             out, _ = self.tr.task.step(self.tr.model, first_batch)
             loss, _ = self.tr.loss_fn(out, first_batch)
         loss.backward()
-        self.tr.opt.step(); self.tr._zero()
+        self.tr.opt.step();
+        self.tr._zero()
         torch.cuda.synchronize()
 
         # static buffers

@@ -1,8 +1,10 @@
 # soundrestorer/data/builder.py
 from __future__ import annotations
+
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Type
+from typing import Any, Dict
+
 from torch.utils.data import DataLoader
 
 try:
@@ -14,22 +16,27 @@ try:
 except Exception:
     DenoiseDataset = None  # type: ignore
 
+
 def _peek_kind(manifest: Path) -> str:
     with manifest.open("r", encoding="utf-8") as f:
         for _ in range(16):
             line = f.readline().strip()
             if not line: continue
-            try: row = json.loads(line)
-            except Exception: continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
             if isinstance(row, dict):
                 if "stems" in row: return "music"
                 if "clean" in row: return "pair"
     return "pair"
 
+
 def _pick_dataset(kind: str):
     if kind == "music" and MusicDenoiseDataset is not None:
         return MusicDenoiseDataset
     return DenoiseDataset
+
 
 def _inst(cls, manifest: Path, split: str, dcfg: Dict[str, Any]):
     try:
@@ -42,6 +49,7 @@ def _inst(cls, manifest: Path, split: str, dcfg: Dict[str, Any]):
             except TypeError:
                 continue
         raise
+
 
 def _mk_loader(ds, dcfg: Dict[str, Any], train: bool) -> DataLoader:
     bs = int(dcfg.get("batch", 12))
@@ -56,6 +64,7 @@ def _mk_loader(ds, dcfg: Dict[str, Any], train: bool) -> DataLoader:
     if callable(collate):
         args["collate_fn"] = collate
     return DataLoader(ds, **args)
+
 
 def build_loaders(cfg: Dict[str, Any]):
     dcfg = cfg if "data" not in cfg else cfg["data"]

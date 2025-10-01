@@ -2,7 +2,6 @@
 # soundrestorer/core/trainer.py
 from __future__ import annotations
 
-import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,8 +15,9 @@ from torch.optim.lr_scheduler import _LRScheduler
 
 from soundrestorer.utils.torch_utils import (
     move_to, autocast_from_amp, need_grad_scaler, set_channels_last,
-    strip_state_dict_prefixes, load_state_dict_loose, latest_checkpoint, format_ema,
+    load_state_dict_loose, latest_checkpoint, format_ema,
 )
+
 
 # -----------------------
 # Simple EMA
@@ -28,6 +28,7 @@ class ModelEMA:
     Exponential Moving Average for a torch.nn.Module.
     Keeps a shadow copy on the same device as the model.
     """
+
     def __init__(self, model: nn.Module, beta: float = 0.0):
         self.beta = float(beta)
         self.active = self.beta > 0.0
@@ -63,6 +64,7 @@ class ModelEMA:
         if self.shadow is not None and sd:
             self.shadow.load_state_dict(sd, strict=False)
 
+
 # -----------------------
 # Trainer
 # -----------------------
@@ -72,6 +74,7 @@ class TrainState:
     epoch: int = 0
     global_step: int = 0
 
+
 class Trainer:
     """
     Orchestrates training for a single Task module (which wraps the model).
@@ -80,24 +83,27 @@ class Trainer:
     """
 
     def __init__(
-        self,
-        *,
-        task: nn.Module,
-        loss_fn,
-        optimizer: Optimizer,
-        scheduler: Optional[_LRScheduler],
-        run_dir: Path,
-        device: torch.device,
-        amp: str = "off",
-        grad_accum: int = 1,
-        grad_clip: float = 0.0,
-        channels_last: bool = True,
-        compile: bool = False,
-        ema_beta: float = 0.0,
-        callbacks: Optional[List[Any]] = None,
-        print_every: int = 50,
+            self,
+            *,
+            task: nn.Module,
+            loss_fn,
+            optimizer: Optimizer,
+            scheduler: Optional[_LRScheduler],
+            run_dir: Path,
+            device: torch.device,
+            amp: str = "off",
+            grad_accum: int = 1,
+            grad_clip: float = 0.0,
+            channels_last: bool = True,
+            compile: bool = False,
+            ema_beta: float = 0.0,
+            callbacks: Optional[List[Any]] = None,
+            print_every: int = 50,
     ):
         self.task = task
+        # NEW: legacy alias — some callbacks expect trainer.model
+        self.model = self.task
+
         self.loss_fn = loss_fn
         self.optim = optimizer
         self.sched = scheduler
@@ -138,13 +144,13 @@ class Trainer:
     # -----------------------
 
     def fit(
-        self,
-        train_loader: Iterable[Dict[str, torch.Tensor]],
-        val_loader: Optional[Iterable[Dict[str, torch.Tensor]]] = None,
-        *,
-        epochs: int,
-        save_every: int = 1,
-        overfit_steps: int = 0,
+            self,
+            train_loader: Iterable[Dict[str, torch.Tensor]],
+            val_loader: Optional[Iterable[Dict[str, torch.Tensor]]] = None,
+            *,
+            epochs: int,
+            save_every: int = 1,
+            overfit_steps: int = 0,
     ):
         # callbacks: fit begin
         for cb in self.callbacks:
@@ -173,15 +179,30 @@ class Trainer:
         # main loop
         for epoch in range(self.state.epoch + 1, self.state.epoch + 1 + total_epochs):
             # callbacks: epoch begin
+            # Call both new-style and legacy epoch-begin hooks
             for cb in self.callbacks:
                 fn = getattr(cb, "on_epoch_begin", None)
                 if callable(fn): fn(self, epoch)
+                fn_legacy = getattr(cb, "on_epoch_start", None)
+                if callable(fn_legacy): fn_legacy(trainer=self, state=self.state)
 
             start_t = time.time()
             tr_loss, tr_items = self._run_train_epoch(train_loader, epoch, overfit_steps)
-            val_loss, val_items = (float("nan"), 0)
             if val_loader is not None:
+                for cb in self.callbacks:
+                    fn = getattr(cb, "on_val_start", None)
+                    if callable(fn): fn(trainer=self, state=self.state)
                 val_loss, val_items = self._run_val_epoch(val_loader, epoch)
+                for cb in self.callbacks:
+                    fn = getattr(cb, "on_val_end", None)
+                    if callable(fn):
+                        fn(trainer=self, state=self.state,
+                           train_loss=tr_loss, val_loss=val_loss,
+                           train_comps=None, val_comps=None,
+                           train_used=tr_items, train_skipped=0,
+                           epoch_time=0.0)
+            else:
+                val_loss, val_items = (float("nan"), 0)
 
             elapsed = time.time() - start_t
             lr = self.optim.param_groups[0]["lr"]
@@ -226,10 +247,10 @@ class Trainer:
             self.optim.step()
 
     def _run_train_epoch(
-        self,
-        loader: Iterable[Dict[str, torch.Tensor]],
-        epoch: int,
-        overfit_steps: int = 0,
+            self,
+            loader: Iterable[Dict[str, torch.Tensor]],
+            epoch: int,
+            overfit_steps: int = 0,
     ) -> Tuple[float, int]:
         self.task.train()
         running = 0.0
@@ -248,6 +269,14 @@ class Trainer:
             else:
                 batch = move_to(batch, self.device)
 
+            # Legacy per-batch start (needed by ProcNoiseAugmentCallback)
+            for cb in self.callbacks:
+                fn = getattr(cb, "on_batch_start", None)
+                if callable(fn):
+                    try:
+                        fn(trainer=self, state=self.state, batch=batch)
+                    except Exception as e:
+                        print(f"[cb-warn] on_batch_start error: {e}")
             # forward + loss
             with self.autocast:
                 outputs = self.task(batch)
@@ -282,6 +311,7 @@ class Trainer:
             n_items += 1
 
             # callbacks: train-batch-end
+            # new-style batch-end (already present)
             for cb in self.callbacks:
                 fn = getattr(cb, "on_train_batch_end", None)
                 if callable(fn):
@@ -290,21 +320,30 @@ class Trainer:
                     except Exception as e:
                         print(f"[cb-warn] on_train_batch_end error: {e}")
 
+            # legacy batch-end
+            for cb in self.callbacks:
+                fn_legacy = getattr(cb, "on_batch_end", None)
+                if callable(fn_legacy):
+                    try:
+                        fn_legacy(trainer=self, state=self.state, batch=batch, outputs=outputs)
+                    except Exception as e:
+                        print(f"[cb-warn] on_batch_end error: {e}")
+
             if overfit_steps > 0 and step_in_epoch >= overfit_steps:
                 break
 
             if self.print_every and (batch_idx + 1) % self.print_every == 0:
                 lr = self.optim.param_groups[0]["lr"]
-                print(f"train {epoch:03d}: {batch_idx+1}/{overfit_steps or len(loader)} | "
-                      f"loss={running/max(1,n_items):.4f} | lr={lr:.2e}")
+                print(f"train {epoch:03d}: {batch_idx + 1}/{overfit_steps or len(loader)} | "
+                      f"loss={running / max(1, n_items):.4f} | lr={lr:.2e}")
 
         return running / max(1, n_items), n_items
 
     @torch.no_grad()
     def _run_val_epoch(
-        self,
-        loader: Iterable[Dict[str, torch.Tensor]],
-        epoch: int,
+            self,
+            loader: Iterable[Dict[str, torch.Tensor]],
+            epoch: int,
     ) -> Tuple[float, int]:
         self.task.eval()
         running = 0.0

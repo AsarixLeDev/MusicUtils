@@ -1,20 +1,22 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import csv, math
+import csv
+import math
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, List
 
 import torch
 
+from soundrestorer.callbacks.callbacks import Callback
 from soundrestorer.callbacks.utils import (
     Triad, save_wav_triads, triad_metrics, infer_sr
 )
 from soundrestorer.metrics.common import (
     silence_fraction, match_len
 )
-
 from soundrestorer.utils.metrics import rms_db
+
 
 def _as_float(x):
     if isinstance(x, torch.Tensor):
@@ -25,7 +27,7 @@ def _as_float(x):
         return float("nan")
 
 
-class DataAuditCallback:
+class DataAuditCallback(Callback):
     """
     Save a small, representative subset of train batches in each epoch and
     emit a CSV `audit.csv` with quick stats (SNR, SI, silence %, RMS in dB).
@@ -37,15 +39,15 @@ class DataAuditCallback:
     """
 
     def __init__(
-        self,
-        *,
-        max_items: int = 12,
-        take_from_batches: int = 6,
-        subdir: str = "logs/data_audit",
-        sr: Optional[int] = None,
-        silence_threshold: float = 0.95,    # fraction
-        write_wavs: bool = True,
-        write_csv: bool = True,
+            self,
+            *,
+            max_items: int = 12,
+            take_from_batches: int = 6,
+            subdir: str = "logs/data_audit",
+            sr: Optional[int] = None,
+            silence_threshold: float = 0.95,  # fraction
+            write_wavs: bool = True,
+            write_csv: bool = True,
     ):
         self.max_items = int(max_items)
         self.take_from_batches = int(take_from_batches)
@@ -74,11 +76,11 @@ class DataAuditCallback:
               f"from {self.take_from_batches} batches -> {self._ep_dir}")
 
     def on_train_batch_end(
-        self,
-        trainer,
-        batch_idx: int,
-        batch: Dict[str, torch.Tensor],
-        outputs: Dict[str, torch.Tensor],
+            self,
+            trainer,
+            batch_idx: int,
+            batch: Dict[str, torch.Tensor],
+            outputs: Dict[str, torch.Tensor],
     ) -> None:
         if self._saved >= self.max_items: return
         if batch_idx >= self.take_from_batches: return
@@ -96,9 +98,9 @@ class DataAuditCallback:
         count_here = min(per_batch, self.max_items - self._saved)
 
         for i in range(min(B, count_here)):
-            y_i = yhat[i:i+1]
-            c_i = clean[i:i+1]
-            n_i = noisy[i:i+1] if noisy is not None else None
+            y_i = yhat[i:i + 1]
+            c_i = clean[i:i + 1]
+            n_i = noisy[i:i + 1] if noisy is not None else None
 
             # squash batch dim to [C,T]
             if y_i.dim() == 3: y_i = y_i[0]
@@ -145,7 +147,8 @@ class DataAuditCallback:
         # write per-item CSV
         with csv_path.open("w", newline="") as f:
             keys = sorted(self._rows[0].keys())
-            w = csv.DictWriter(f, fieldnames=keys); w.writeheader()
+            w = csv.DictWriter(f, fieldnames=keys);
+            w.writeheader()
             for r in self._rows: w.writerow(r)
 
         # human summary (floats only)
@@ -153,8 +156,8 @@ class DataAuditCallback:
                 if r.get("snr_noisy_clean_db") is not None]
         if snrs:
             mean_snr = float(sum(snrs) / len(snrs))
-            min_snr  = float(min(snrs))
-            max_snr  = float(max(snrs))
+            min_snr = float(min(snrs))
+            max_snr = float(max(snrs))
         else:
             mean_snr = min_snr = max_snr = float("nan")
 
@@ -164,5 +167,5 @@ class DataAuditCallback:
 
         print(f"[data-audit] saved {len(self._rows)} items | "
               f"SNR mean {mean_snr:+.2f} dB (min {min_snr:+.2f}, max {max_snr:+.2f}) | "
-              f"noisy_sil>{int(self.silence_threshold*100)}% count {n_sil95}")
+              f"noisy_sil>{int(self.silence_threshold * 100)}% count {n_sil95}")
         print(f"[data-audit] wrote {csv_path}")

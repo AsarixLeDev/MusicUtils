@@ -1,8 +1,12 @@
 from __future__ import annotations
-import torch
+
 from typing import Tuple
-from ..utils.audio import stft_pair, istft_from
+
+import torch
+
 from ..core.registry import TASKS
+from ..utils.audio import stft_pair, istft_from
+
 
 @TASKS.register("denoise_stft")
 class DenoiseSTFTTask:
@@ -10,14 +14,15 @@ class DenoiseSTFTTask:
                  clamp_mask_tanh: float = 0.0,
                  safe_unity_fallback: bool = True,
                  device="cuda",
-                 mask_floor: float = 0.50):                 # <-- NEW
-        self.n_fft=int(n_fft); self.hop=int(hop)
-        self.mask_variant=str(mask_variant).lower()
-        self.mask_limit=float(mask_limit)
+                 mask_floor: float = 0.50):  # <-- NEW
+        self.n_fft = int(n_fft);
+        self.hop = int(hop)
+        self.mask_variant = str(mask_variant).lower()
+        self.mask_limit = float(mask_limit)
         self.clamp_mask = float(clamp_mask_tanh)
         self.safe_unity = bool(safe_unity_fallback)
-        self.device=device
-        self.mask_floor = float(mask_floor)               # <-- NEW
+        self.device = device
+        self.mask_floor = float(mask_floor)  # <-- NEW
         self._win = None
 
     def _win_on(self, device, dtype=torch.float32):

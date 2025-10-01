@@ -10,12 +10,13 @@ Compatible with your trainer: outputs["yhat"] is waveform (B, T).
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Dict, Any, Tuple
-import math, torch, torch.nn as nn
-import torchaudio
 
+from dataclasses import dataclass
+from typing import Dict, Any
+
+import torch
 import torch.nn as nn  # add near top if not present
+
 
 # ---------------- cfg ----------------
 
@@ -38,6 +39,7 @@ class DenoiseSTFTCfg:
     eps: float = 1e-8
     return_debug: bool = False
 
+
 # ------------- helpers -------------
 
 def _get_window(name: str, n_fft: int, device, dtype):
@@ -48,6 +50,7 @@ def _get_window(name: str, n_fft: int, device, dtype):
         return torch.hamming_window(n_fft, device=device, dtype=dtype)
     # default
     return torch.hann_window(n_fft, device=device, dtype=dtype)
+
 
 def _stft(y: torch.Tensor, cfg: DenoiseSTFTCfg) -> torch.Tensor:
     win = _get_window(cfg.window, cfg.n_fft, y.device, torch.float32)
@@ -64,6 +67,7 @@ def _first_conv_in_channels(model: nn.Module) -> int:
         if isinstance(m, nn.Conv2d):
             return int(m.in_channels)
     return 1
+
 
 def _istft(spec: torch.Tensor, cfg: DenoiseSTFTCfg, length: int) -> torch.Tensor:
     """
@@ -88,17 +92,20 @@ def _istft(spec: torch.Tensor, cfg: DenoiseSTFTCfg, length: int) -> torch.Tensor
     )
     return y  # (B,T)
 
+
 def _apply_mag_mask(spec: torch.Tensor, mask: torch.Tensor, cfg: DenoiseSTFTCfg) -> torch.Tensor:
     mag = spec.abs()
     pha = torch.angle(spec)  # noqa: E999 (ok at runtime)
     mag_hat = mag * mask
     return torch.polar(mag_hat, pha)
 
+
 def _safe_mask(mask: torch.Tensor, cfg: DenoiseSTFTCfg) -> torch.Tensor:
     if cfg.clamp_mask_tanh and cfg.clamp_mask_tanh > 0:
         mask = torch.tanh(mask / cfg.clamp_mask_tanh) * cfg.clamp_mask_tanh
     # Always enforce [floor, limit] for magnitude-like masks
     return mask.clamp(min=cfg.mask_floor, max=cfg.mask_limit)
+
 
 def _variant_from_head(head_out: torch.Tensor, variant: str, cfg: DenoiseSTFTCfg):
     """
@@ -146,6 +153,7 @@ def _variant_from_head(head_out: torch.Tensor, variant: str, cfg: DenoiseSTFTCfg
     stats["mask_amp_max"] = float(amp.max().item())
     return M, stats
 
+
 # ------------- main task -------------
 
 class DenoiseSTFTMusic(nn.Module):
@@ -153,45 +161,68 @@ class DenoiseSTFTMusic(nn.Module):
         super().__init__()
         self.model = model
         self.cfg = DenoiseSTFTCfg(
-            n_fft           = int(args.get("n_fft", 1024)),
-            hop_length     = int(args.get("hop_length", 256)),
-            win_length     = int(args.get("win_length", 1024)),
-            center         = bool(args.get("center", True)),
-            window         = str(args.get("window", "hann")),
-            mask_variant   = str(args.get("mask_variant", "mag_sigmoid")),
-            mask_floor     = float(args.get("mask_floor", 0.30)),
-            mask_limit     = float(args.get("mask_limit", 1.80)),
-            clamp_mask_tanh= float(args.get("clamp_mask_tanh", 0.0)),
-            safe_unity_fallback = bool(args.get("safe_unity_fallback", True)),
-            return_debug   = bool(args.get("return_debug", False)),
+            n_fft=int(args.get("n_fft", 1024)),
+            hop_length=int(args.get("hop_length", 256)),
+            win_length=int(args.get("win_length", 1024)),
+            center=bool(args.get("center", True)),
+            window=str(args.get("window", "hann")),
+            mask_variant=str(args.get("mask_variant", "mag_sigmoid")),
+            mask_floor=float(args.get("mask_floor", 0.30)),
+            mask_limit=float(args.get("mask_limit", 1.80)),
+            clamp_mask_tanh=float(args.get("clamp_mask_tanh", 0.0)),
+            safe_unity_fallback=bool(args.get("safe_unity_fallback", True)),
+            return_debug=bool(args.get("return_debug", False)),
         )
         # NEW: detect what the model expects at its first conv
         self._in_ch = _first_conv_in_channels(self.model)
 
-    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        noisy = batch["noisy"]
-        if noisy.dim() == 3 and noisy.size(1) == 1:
-            noisy = noisy[:, 0]  # (B,T)
-        elif noisy.dim() != 2:
-            raise ValueError("Expected noisy as (B,T) or (B,1,T)")
+    def forward(self, batch: Dict[str, torch.Tensor] | List[torch.Tensor] | Tuple[torch.Tensor, ...]) -> Dict[
+        str, torch.Tensor]:
+        """
+        Accept either:
+          - dict: {"noisy": (B,T) or (B,1,T) or (B,C,T), ...}
+          - tuple/list: [noisy, clean, ...] in classic dataset style
+        Normalize 'noisy' to (B,T) float32 on the current device.
+        """
+        # -------------- get 'noisy' tensor --------------
+        if isinstance(batch, dict):
+            noisy = batch.get("noisy", None)
+            if noisy is None:
+                raise ValueError("batch dict must contain key 'noisy'")
+        elif isinstance(batch, (list, tuple)) and len(batch) >= 1:
+            noisy = batch[0]
+        else:
+            raise ValueError("Batch must be a dict with 'noisy' or a list/tuple like [noisy, clean, ...]")
 
-        B, T = noisy.shape
+        import torch
+        noisy = noisy.to(torch.float32)
+
+        # -------------- normalize shape to (B,T) --------------
+        if noisy.dim() == 1:
+            # (T,) -> (1,T)
+            noisy_bt = noisy.unsqueeze(0)
+        elif noisy.dim() == 2:
+            noisy_bt = noisy  # (B,T)
+        elif noisy.dim() == 3:
+            # (B,C,T) -> mono (B,T)
+            noisy_bt = noisy.mean(dim=1)
+        else:
+            raise ValueError(f"Unexpected noisy shape {tuple(noisy.shape)}; expected (T)/(B,T)/(C,T)/(B,C,T)")
+
+        B, T = noisy_bt.shape
+        # ------------------------------------------------------
 
         # STFT
-        S = _stft(noisy, self.cfg)  # (B,F,T) complex
+        S = _stft(noisy_bt, self.cfg)  # (B,F,T) complex
         mag = torch.abs(S)
 
-        # NEW: choose representation to match the model's expected input channels
+        # choose input repr based on model in_channels
         if self._in_ch >= 2:
-            # Feed RI (2 channels)
             x_in = torch.stack([S.real, S.imag], dim=1)  # (B,2,F,T)
         else:
-            # Feed log-magnitude (1 channel)
             x_in = torch.log1p(mag).unsqueeze(1)  # (B,1,F,T)
 
         head = self.model(x_in)  # (B,C_out,F,T)
-
-        # Mask mapping stays the same as before:
         M, mstats = _variant_from_head(head, self.cfg.mask_variant, self.cfg)
 
         if torch.is_complex(M):
@@ -203,9 +234,8 @@ class DenoiseSTFTMusic(nn.Module):
 
         yhat = _istft(Shat, self.cfg, length=T)  # (B,T)
 
-        if self.cfg.safe_unity_fallback:
-            if not torch.isfinite(yhat).all():
-                yhat = noisy.clone()
+        if self.cfg.safe_unity_fallback and not torch.isfinite(yhat).all():
+            yhat = noisy_bt.clone()
 
         out = {"yhat": yhat}
         if self.cfg.return_debug:

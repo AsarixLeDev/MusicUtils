@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
 # soundrestorer/eval/evaluator.py
 from __future__ import annotations
-from typing import Dict, List, Optional, Tuple
-import csv, math, torch, statistics as stats
+
+import csv
+import statistics as stats
+import torch
 from pathlib import Path
-from ..metrics.registry import compute_metrics
+from typing import Dict, List, Optional
+
 from ..metrics.common import rms_db
+from ..metrics.registry import compute_metrics
 
 
 def _to_float_list(x: torch.Tensor) -> List[float]:
@@ -19,15 +23,15 @@ def robust_summary(values: List[float]) -> Dict[str, float]:
                     p75=float("nan"), min=float("nan"), max=float("nan"))
     vs = sorted(values)
     n = len(vs)
-    q1 = vs[max(0, (n*25)//100)]
-    q3 = vs[min(n-1, (n*75)//100)]
+    q1 = vs[max(0, (n * 25) // 100)]
+    q3 = vs[min(n - 1, (n * 75) // 100)]
     return dict(
-        mean = sum(vs)/n,
-        median = stats.median(vs),
-        p25 = q1,
-        p75 = q3,
-        min = vs[0],
-        max = vs[-1],
+        mean=sum(vs) / n,
+        median=stats.median(vs),
+        p25=q1,
+        p75=q3,
+        min=vs[0],
+        max=vs[-1],
     )
 
 
@@ -39,6 +43,7 @@ class Evaluator:
         ev.add_triplet(yhat, clean, noisy, uid="ep010_idx5")
         ev.finalize(write_csv=".../eval.csv")
     """
+
     def __init__(self, sr: int = 48000, min_clean_rms_db: float = -80.0):
         self.sr = int(sr)
         self.min_clean_rms_db = float(min_clean_rms_db)
@@ -97,7 +102,8 @@ class Evaluator:
                         trend = "↓→0"
                     else:
                         trend = "↑ better"
-                    print(f"{k:14s} | median={s['median']:.4f} | mean={s['mean']:.4f} | IQR=[{s['p25']:.4f},{s['p75']:.4f}] | {trend}")
+                    print(
+                        f"{k:14s} | median={s['median']:.4f} | mean={s['mean']:.4f} | IQR=[{s['p25']:.4f},{s['p75']:.4f}] | {trend}")
 
         if write_csv:
             path = Path(write_csv)

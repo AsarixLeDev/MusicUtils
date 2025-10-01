@@ -1,6 +1,8 @@
 # soundrestorer/core/prefetch.py
 from __future__ import annotations
+
 import torch
+
 
 class CUDAPrefetcher:
     """
@@ -10,14 +12,15 @@ class CUDAPrefetcher:
     - Leaves meta dicts on CPU
     - Optionally sets channels_last on 4D tensors (B,2,F,T)
     """
+
     def __init__(self, loader, device: str = "cuda", channels_last: bool = True):
-        self.src = loader                    # <— keep the DataLoader
+        self.src = loader  # <— keep the DataLoader
         self.device = device
         self.channels_last = bool(channels_last)
         self.stream = torch.cuda.Stream() if device.startswith("cuda") else None
         self.loader = None
         self._next = None
-        self.reset()                         # <— initialize iterator + first preload
+        self.reset()  # <— initialize iterator + first preload
 
     def reset(self, loader=None):
         """

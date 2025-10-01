@@ -1,7 +1,10 @@
 from __future__ import annotations
+
 import torch
+
 from .base import LossModule
 from ..core.registry import LOSSES
+
 
 @LOSSES.register("sisdr")
 class SISDRLoss(LossModule):
@@ -10,6 +13,7 @@ class SISDRLoss(LossModule):
         loss = - SI-SDR(yhat, clean)  [dB]
     Returns both the scalar loss and a comps dict {'sisdr': loss}.
     """
+
     def __init__(self, reduction: str = "mean"):
         self.reduction = str(reduction)
 
@@ -31,6 +35,6 @@ class SISDRLoss(LossModule):
         den = torch.sum(e * e, dim=-1).clamp_min(eps)
         sisdr_db = 10.0 * torch.log10(num / den)
 
-        loss_vec = -sisdr_db   # maximize SI-SDR
+        loss_vec = -sisdr_db  # maximize SI-SDR
         loss = loss_vec.mean() if self.reduction == "mean" else loss_vec
         return loss, {"sisdr": loss}

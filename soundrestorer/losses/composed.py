@@ -1,11 +1,15 @@
 # soundrestorer/losses/composed.py
 from __future__ import annotations
-from typing import Dict, Any, List, Tuple
-import torch, torch.nn as nn
 
-from .mrstft import MRSTFTLoss
+from typing import Dict, Any, List, Tuple
+
+import torch
+import torch.nn as nn
+
 from .l1_wave import L1WaveLoss
+from .mrstft import MRSTFTLoss
 from .sisdr_pos import SISDRPositiveLoss  # adjust name if your file defines a different class
+
 try:
     from .mask_unity_reg import MaskUnityReg
 except Exception:
@@ -19,6 +23,7 @@ REG = {
 if MaskUnityReg is not None:
     REG["mask_unity_reg"] = MaskUnityReg
 
+
 class ComposedLoss(nn.Module):
     def __init__(self, items: List[Dict[str, Any]]):
         super().__init__()
@@ -29,6 +34,7 @@ class ComposedLoss(nn.Module):
             cls = REG[name]
             self.entries.append(cls(**(it.get("args") or {})))
             self.weights.append(float(it.get("weight", 1.0)))
+
     def forward(self, outputs, batch) -> Tuple[torch.Tensor, Dict[str, float]]:
         total = torch.zeros((), device=outputs["yhat"].device, dtype=outputs["yhat"].dtype)
         comps = {}
@@ -41,6 +47,7 @@ class ComposedLoss(nn.Module):
             total = total + w * v
         comps["total"] = float(total.detach().cpu())
         return total, comps
+
 
 def build_losses(cfg: Dict[str, Any]) -> nn.Module:
     items = (cfg.get("losses") or {}).get("items", [])

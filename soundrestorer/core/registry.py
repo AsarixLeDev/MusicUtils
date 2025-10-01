@@ -1,6 +1,7 @@
 # Minimal registry with decorators
 
-from typing import Callable, Dict, Any
+from typing import Dict, Any
+
 
 class Registry:
     def __init__(self, name: str):
@@ -14,6 +15,7 @@ class Registry:
                 raise KeyError(f"{self.name} registry already has key: {key}")
             self._store[key] = obj
             return obj
+
         return deco
 
     def get(self, name: str):
@@ -25,8 +27,9 @@ class Registry:
     def build(self, name: str, **kwargs):
         return self.get(name)(**kwargs)
 
-MODELS     = Registry("model")
-DATASETS   = Registry("dataset")
-LOSSES     = Registry("loss")
-TASKS      = Registry("task")
-CALLBACKS  = Registry("callback")
+
+MODELS = Registry("model")
+DATASETS = Registry("dataset")
+LOSSES = Registry("loss")
+TASKS = Registry("task")
+CALLBACKS = Registry("callback")

@@ -1,7 +1,7 @@
-from ..core.registry import MODELS
 # Reuse your existing ComplexUNet class
 from soundrestorer.models.denoiser_net import ComplexUNet as _ComplexUNet
-import torch.nn as nn
+from ..core.registry import MODELS
+
 
 @MODELS.register("complex_unet")
 class ComplexUNetWrapper(_ComplexUNet):

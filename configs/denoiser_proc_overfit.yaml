@@ -66,7 +66,7 @@ callbacks:
   proc_noise:
     enable: true
     prob: 1.0          # apply to every batch in this micro-test
-    snr_min: 0.0
+    snr_min: -2.0
     snr_max: 12.0
     noise_cfg:
       # these keys are supported by your existing NoiseFactory

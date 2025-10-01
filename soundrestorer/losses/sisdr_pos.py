@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-from typing import Dict, Any
-import torch, torch.nn as nn
-import math
+
+from typing import Dict
+
+import torch
+import torch.nn as nn
 
 
 def _flatten_audio(x: torch.Tensor) -> torch.Tensor:
@@ -17,7 +19,7 @@ def _si_sdr_parts(est: torch.Tensor, ref: torch.Tensor, eps: float):
     ref = ref - ref.mean(dim=-1, keepdim=True)
     # Projection of est onto ref
     dot = (est * ref).sum(dim=-1, keepdim=True)
-    ref_pow = (ref**2).sum(dim=-1, keepdim=True) + eps
+    ref_pow = (ref ** 2).sum(dim=-1, keepdim=True) + eps
     s_target = (dot / ref_pow) * ref
     e = est - s_target
     return s_target, e
@@ -29,6 +31,7 @@ class SISDRPositiveLoss(nn.Module):
        loss = mean( ||e||^2 / (||s_target||^2 + eps) )
     Also reports human-readable SI-SDR dB and ΔSI vs noisy if available.
     """
+
     def __init__(self, eps: float = 1e-8, cap: float = 1e6):
         super().__init__()
         self.eps = float(eps)
@@ -36,11 +39,11 @@ class SISDRPositiveLoss(nn.Module):
 
     def forward(self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]):
         yhat = _flatten_audio(outputs["yhat"]).to(torch.float32)
-        tgt  = _flatten_audio(batch["clean"]).to(torch.float32)
+        tgt = _flatten_audio(batch["clean"]).to(torch.float32)
 
         s_t, e = _si_sdr_parts(yhat, tgt, self.eps)
-        p_e = (e**2).sum(dim=-1)
-        p_s = (s_t**2).sum(dim=-1) + self.eps
+        p_e = (e ** 2).sum(dim=-1)
+        p_s = (s_t ** 2).sum(dim=-1) + self.eps
         ratio = (p_e / p_s).clamp_max(self.cap)
         loss = ratio.mean()
 
@@ -52,8 +55,8 @@ class SISDRPositiveLoss(nn.Module):
         if "noisy" in batch:
             noisy = _flatten_audio(batch["noisy"]).to(torch.float32)
             s_tn, en = _si_sdr_parts(noisy, tgt, self.eps)
-            p_en = (en**2).sum(dim=-1)
-            p_sn = (s_tn**2).sum(dim=-1) + self.eps
+            p_en = (en ** 2).sum(dim=-1)
+            p_sn = (s_tn ** 2).sum(dim=-1) + self.eps
             si_noisy_db = 10.0 * torch.log10((p_sn / (p_en + self.eps)).clamp_min(self.eps)).mean()
             delta_db = si_db - si_noisy_db
 

@@ -10,15 +10,17 @@ import torch
 import torchaudio
 
 from soundrestorer.metrics.common import (
-    to_mono, match_len, resample_if_needed, si_sdr_db, snr_db
+    match_len, resample_if_needed, si_sdr_db, snr_db
 )
+
 
 @dataclass
 class Triad:
     clean: Optional[torch.Tensor]  # [C,T]
     noisy: Optional[torch.Tensor]  # [C,T]
-    yhat:  Optional[torch.Tensor]  # [C,T]
+    yhat: Optional[torch.Tensor]  # [C,T]
     sr: int
+
 
 def _prep_audio(x: torch.Tensor) -> torch.Tensor:
     """
@@ -42,17 +44,19 @@ def _prep_audio(x: torch.Tensor) -> torch.Tensor:
     x = torch.clamp(x, -1.0, 1.0)
     return x
 
+
 def save_wav(path: Path, wav: torch.Tensor, sr: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torchaudio.save(str(path), wav, sr)
 
+
 def save_wav_triads(
-    out_dir: Path,
-    base: str,
-    triad: Triad,
-    *,
-    want_resid: bool = True,
-    prefer_clean_resid: bool = True,
+        out_dir: Path,
+        base: str,
+        triad: Triad,
+        *,
+        want_resid: bool = True,
+        prefer_clean_resid: bool = True,
 ) -> Dict[str, Path]:
     """
     Save _clean/_noisy/_yhat (+ optional _resid) with robust dtype handling.
@@ -61,18 +65,21 @@ def save_wav_triads(
     paths: Dict[str, Path] = {}
     c = _prep_audio(triad.clean) if triad.clean is not None else None
     n = _prep_audio(triad.noisy) if triad.noisy is not None else None
-    y = _prep_audio(triad.yhat)  if triad.yhat  is not None else None
+    y = _prep_audio(triad.yhat) if triad.yhat is not None else None
     sr = triad.sr
 
     if c is not None:
         p = out_dir / f"{base}_clean.wav"
-        save_wav(p, c, sr); paths["clean"] = p
+        save_wav(p, c, sr);
+        paths["clean"] = p
     if n is not None:
         p = out_dir / f"{base}_noisy.wav"
-        save_wav(p, n, sr); paths["noisy"] = p
+        save_wav(p, n, sr);
+        paths["noisy"] = p
     if y is not None:
         p = out_dir / f"{base}_yhat.wav"
-        save_wav(p, y, sr); paths["yhat"] = p
+        save_wav(p, y, sr);
+        paths["yhat"] = p
 
     if want_resid and y is not None:
         resid = None
@@ -85,9 +92,11 @@ def save_wav_triads(
         if resid is not None:
             resid = torch.clamp(resid, -1.0, 1.0)
             p = out_dir / f"{base}_resid.wav"
-            save_wav(p, resid, sr); paths["resid"] = p
+            save_wav(p, resid, sr);
+            paths["resid"] = p
 
     return paths
+
 
 # soundrestorer/callbacks/utils.py
 
@@ -98,10 +107,11 @@ def _as_float(x):
         return float(x.detach().mean().cpu().item())
     return float(x)
 
+
 def triad_metrics(
-    yhat: torch.Tensor,
-    clean: Optional[torch.Tensor],
-    noisy: Optional[torch.Tensor],
+        yhat: torch.Tensor,
+        clean: Optional[torch.Tensor],
+        noisy: Optional[torch.Tensor],
 ) -> Dict[str, float]:
     """
     Compute a minimal set of quick metrics from waveforms (channel-first).
@@ -130,6 +140,7 @@ def infer_sr(trainer) -> Optional[int]:
             except Exception:
                 pass
     return None
+
 
 def ensure_sr(x: torch.Tensor, sr_x: int, target_sr: Optional[int]) -> Tuple[torch.Tensor, int]:
     if target_sr is None or target_sr == sr_x:

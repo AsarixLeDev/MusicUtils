@@ -1,7 +1,8 @@
 from __future__ import annotations
-import torch
+
 from .base import LossModule
 from ..core.registry import LOSSES
+
 
 @LOSSES.register("mask_unity_reg")
 class MaskUnityReg(LossModule):
@@ -10,6 +11,7 @@ class MaskUnityReg(LossModule):
     Reads R/I from Task outputs so it matches the actual clamp/limit logic.
     Keep the weight small and decay it away in a curriculum.
     """
+
     def __init__(self, p: float = 2.0):
         self.p = float(p)
 

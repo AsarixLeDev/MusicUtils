@@ -1,7 +1,9 @@
-import torch, contextlib
-from ..core.registry import MODELS
-from .complex_unet_lstm import ComplexUNetLSTM
+import torch
+
 from .complex_unet import ComplexUNetWrapper as ComplexUNet
+from .complex_unet_lstm import ComplexUNetLSTM
+from ..core.registry import MODELS
+
 
 @MODELS.register("complex_unet_auto")
 class AutoComplexUNet(torch.nn.Module):
@@ -11,7 +13,7 @@ class AutoComplexUNet(torch.nn.Module):
         want_lstm = bool(prefer_temporal)
         if want_lstm and torch.cuda.is_available():
             free, total = torch.cuda.mem_get_info()
-            free_mb = free // (1024*1024)
+            free_mb = free // (1024 * 1024)
             if free_mb >= int(min_free_mem_mb):
                 try:
                     self.inner = ComplexUNetLSTM(base=base, lstm_hidden=lstm_hidden,

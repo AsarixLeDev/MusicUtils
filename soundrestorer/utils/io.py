@@ -1,17 +1,21 @@
 # -*- coding: utf-8 -*-
 # soundrestorer/utils/io.py
 from __future__ import annotations
-from typing import Iterable, List, Dict, Any, Optional
-from pathlib import Path
+
 import csv
 import json
+from pathlib import Path
+from typing import Iterable, List, Dict, Any, Optional
+
 import torch
 
 try:
     import torchaudio
+
     _HAS_TA = True
 except Exception:
     _HAS_TA = False
+
 
 def read_wav(path: str | Path, sr: Optional[int] = None, mono: Optional[bool] = None) -> torch.Tensor:
     """
@@ -28,19 +32,22 @@ def read_wav(path: str | Path, sr: Optional[int] = None, mono: Optional[bool] = 
         wav = wav.mean(dim=0, keepdim=True)
     return wav
 
+
 def write_wav(path: str | Path, wav: torch.Tensor, sr: int):
     """
     Save waveform tensor. Accepts [T], [C,T], [B,C,T] (B>1 saves first item).
     """
     if not _HAS_TA:
         raise RuntimeError("torchaudio is required for write_wav")
-    p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
+    p = Path(path);
+    p.parent.mkdir(parents=True, exist_ok=True)
     x = wav
     if x.dim() == 3:
         x = x[0]  # take first item
     if x.dim() == 1:
         x = x.unsqueeze(0)
     torchaudio.save(str(p), x.to(torch.float32), sr)
+
 
 def read_jsonl(path: str | Path) -> List[Dict[str, Any]]:
     items = []
@@ -51,14 +58,18 @@ def read_jsonl(path: str | Path) -> List[Dict[str, Any]]:
             items.append(json.loads(line))
     return items
 
+
 def write_jsonl(path: str | Path, rows: Iterable[Dict[str, Any]]):
-    p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
+    p = Path(path);
+    p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
+
 def write_csv(path: str | Path, rows: Iterable[Dict[str, Any]], fieldnames: List[str]):
-    p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
+    p = Path(path);
+    p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()

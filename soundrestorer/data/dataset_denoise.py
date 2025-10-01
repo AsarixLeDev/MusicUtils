@@ -1,11 +1,13 @@
 # Thin wrappers to reuse your existing dataset implementation.
-from ..core.registry import DATASETS
 from soundrestorer.data.dataset import DenoiseDataset as _DD, DenoiseConfig as _DC
+from ..core.registry import DATASETS
+
 
 @DATASETS.register("denoise")
 class DenoiseDatasetWrapper(_DD):
     # inherit as-is; constructor signature matches original
     pass
+
 
 def make_denoise_config(ds_cfg: dict) -> _DC:
     return _DC(

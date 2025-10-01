@@ -1,5 +1,6 @@
 # soundrestorer/tasks/factory.py
 from __future__ import annotations
+
 import importlib
 import inspect
 from types import ModuleType
@@ -9,12 +10,14 @@ import torch.nn as nn
 
 # Map legacy name straight to the new task
 TASK_ALIASES = {
-    "denoise_stft":       ("soundrestorer.tasks.denoise_stft_music", "DenoiseSTFTMusic"),
+    "denoise_stft": ("soundrestorer.tasks.denoise_stft_music", "DenoiseSTFTMusic"),
     "denoise_stft_music": ("soundrestorer.tasks.denoise_stft_music", "DenoiseSTFTMusic"),
 }
 
+
 def _import(path: str) -> ModuleType:
     return importlib.import_module(path)
+
 
 def _pick_ctor(mod: ModuleType) -> Optional[Callable[..., Any]]:
     # Prefer factory functions if present
@@ -29,13 +32,16 @@ def _pick_ctor(mod: ModuleType) -> Optional[Callable[..., Any]]:
             candidates.append(obj)
     if not candidates:
         return None
+
     # Prefer denoise/stft/mask names
     def _rank(cls):
         n = cls.__name__.lower()
         score = sum(k in n for k in ("denoise", "stft", "mask", "task", "model"))
         return (-score, len(n))
+
     candidates.sort(key=_rank)
     return candidates[0]
+
 
 def _call_ctor_adapt(ctor: Callable[..., Any], args: Dict[str, Any]):
     """
@@ -51,11 +57,12 @@ def _call_ctor_adapt(ctor: Callable[..., Any], args: Dict[str, Any]):
 
     # Case 1: ctor expects (model, args)
     if "model" in params and "args" in params and all(
-        (k in ("self", "model", "args") or params[k].kind in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL))
-        for k in params
+            (k in ("self", "model", "args") or params[k].kind in (inspect.Parameter.VAR_KEYWORD,
+                                                                  inspect.Parameter.VAR_POSITIONAL))
+            for k in params
     ):
         model = args["model"]
-        cfg   = {k: v for k, v in args.items() if k != "model"}
+        cfg = {k: v for k, v in args.items() if k != "model"}
         return ctor(model=model, args=cfg)
 
     # Case 2: ctor exposes specific kwargs (e.g., n_fft, hop_length, ...)
@@ -64,8 +71,9 @@ def _call_ctor_adapt(ctor: Callable[..., Any], args: Dict[str, Any]):
     except TypeError:
         # Last resort: try (model, args) even if signature parse failed above
         model = args["model"]
-        cfg   = {k: v for k, v in args.items() if k != "model"}
+        cfg = {k: v for k, v in args.items() if k != "model"}
         return ctor(model=model, args=cfg)
+
 
 def create_task(name_or_cfg: Any, **kwargs) -> nn.Module:
     """
@@ -93,9 +101,9 @@ def create_task(name_or_cfg: Any, **kwargs) -> nn.Module:
 
     # 2) Heuristic paths
     for cand in (
-        f"soundrestorer.tasks.{name}",
-        f"soundrestorer.tasks.{name.replace('-', '_')}",
-        name,  # fully qualified
+            f"soundrestorer.tasks.{name}",
+            f"soundrestorer.tasks.{name.replace('-', '_')}",
+            name,  # fully qualified
     ):
         try:
             mod = _import(cand)

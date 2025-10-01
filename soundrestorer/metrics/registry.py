@@ -1,19 +1,23 @@
 # -*- coding: utf-8 -*-
 # soundrestorer/metrics/registry.py
 from __future__ import annotations
-from typing import Dict, Any, List, Optional
+
+from typing import Dict, Optional
+
 import torch
+
 from .common import (
     si_sdr_db, si_sdr_error_ratio, snr_db,
     lsd_db, mrstft_metric, stoi_avg, pesq_avg, to_mono, match_lengths
 )
 
+
 # Name -> callable signature: f(yhat, clean, noisy=None, sr=48000) -> Dict[str, Tensor/float]
 def _metric_block(
-    yhat: torch.Tensor,
-    clean: torch.Tensor,
-    noisy: Optional[torch.Tensor],
-    sr: int
+        yhat: torch.Tensor,
+        clean: torch.Tensor,
+        noisy: Optional[torch.Tensor],
+        sr: int
 ) -> Dict[str, torch.Tensor]:
     """
     Default comprehensive block of metrics.
@@ -29,8 +33,8 @@ def _metric_block(
 
     # Waveform MAE / RMSE
     diff = (yhat - clean)
-    out["mae"]  = diff.abs().mean(dim=-1)
-    out["rmse"] = torch.sqrt((diff**2).mean(dim=-1))
+    out["mae"] = diff.abs().mean(dim=-1)
+    out["rmse"] = torch.sqrt((diff ** 2).mean(dim=-1))
 
     # SI-SDR (dB) and error ratio
     si_db = si_sdr_db(yhat, clean)
@@ -47,8 +51,8 @@ def _metric_block(
         out["snr_noisy_db"] = snr_db(noisy, clean)
 
     # Spectral metrics
-    out["lsd_db"] = lsd_db(yhat, clean)                 # RMS dB distance (→0)
-    out["mrstft"] = mrstft_metric(yhat, clean)          # →0
+    out["lsd_db"] = lsd_db(yhat, clean)  # RMS dB distance (→0)
+    out["mrstft"] = mrstft_metric(yhat, clean)  # →0
 
     # Optional STOI/PESQ if available and sr supported
     stoi = stoi_avg(yhat, clean, sr)
@@ -63,12 +67,13 @@ METRIC_REGISTRY = {
     "default_block": _metric_block,
 }
 
+
 def compute_metrics(
-    yhat: torch.Tensor,
-    clean: torch.Tensor,
-    noisy: Optional[torch.Tensor] = None,
-    sr: int = 48000,
-    set_name: str = "default_block"
+        yhat: torch.Tensor,
+        clean: torch.Tensor,
+        noisy: Optional[torch.Tensor] = None,
+        sr: int = 48000,
+        set_name: str = "default_block"
 ) -> Dict[str, torch.Tensor]:
     if set_name not in METRIC_REGISTRY:
         raise KeyError(f"Unknown metric set '{set_name}'. Choose from {list(METRIC_REGISTRY.keys())}")

@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 # soundrestorer/utils/metrics.py
 from __future__ import annotations
+
 from typing import Optional, Sequence, Tuple
+
 import torch
+
 
 # ---------- basic energy / loudness ----------
 
@@ -13,10 +16,12 @@ def rms(x: torch.Tensor, dim: Sequence[int] = (-1,), keepdim: bool = False, eps:
     y = (y + eps).sqrt()
     return y if keepdim else y.squeeze(dim)
 
+
 def rms_db(x: torch.Tensor, dim: Sequence[int] = (-1,), keepdim: bool = False, eps: float = 1e-8) -> torch.Tensor:
     val = rms(x, dim=dim, keepdim=keepdim, eps=eps)
     out = 20.0 * torch.log10(val + eps)
     return out
+
 
 # ---------- error metrics ----------
 
@@ -28,6 +33,7 @@ def mae(x: torch.Tensor, y: torch.Tensor, dim: Optional[Sequence[int]] = None, k
         d = d.mean(dim=k, keepdim=True)
     return d if keepdim else d.squeeze(dim)
 
+
 def mse(x: torch.Tensor, y: torch.Tensor, dim: Optional[Sequence[int]] = None, keepdim: bool = False) -> torch.Tensor:
     d = (x - y) ** 2
     if dim is None:
@@ -35,6 +41,7 @@ def mse(x: torch.Tensor, y: torch.Tensor, dim: Optional[Sequence[int]] = None, k
     for k in sorted([dd if dd >= 0 else d.dim() + dd for dd in dim], reverse=True):
         d = d.mean(dim=k, keepdim=True)
     return d if keepdim else d.squeeze(dim)
+
 
 # ---------- SNR ----------
 
@@ -59,6 +66,7 @@ def snr_db(noisy: torch.Tensor, clean: torch.Tensor, eps: float = 1e-8) -> torch
     den = (err.pow(2).sum(dim=-1) + eps)
     return 10.0 * torch.log10(num / den)
 
+
 # ---------- SI-SDR ----------
 
 def _flatten_bt(x: torch.Tensor) -> Tuple[torch.Tensor, int]:
@@ -71,20 +79,23 @@ def _flatten_bt(x: torch.Tensor) -> Tuple[torch.Tensor, int]:
         return x.view(B, -1), B
     raise ValueError(f"si_sdr_db: bad shape {x.shape}")
 
+
 def _bt(x: torch.Tensor) -> torch.Tensor:
     if x.dim() == 1: return x.unsqueeze(0)
     if x.dim() == 2: return x
     if x.dim() == 3: return x.mean(dim=1)
     raise RuntimeError(f"expected 1/2/3D audio, got {tuple(x.shape)}")
 
+
 @torch.no_grad()
 def si_sdr_db(y: torch.Tensor, x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    y = _bt(y); x = _bt(x)
+    y = _bt(y);
+    x = _bt(x)
     xz = x - x.mean(dim=-1, keepdim=True)
     yz = y - y.mean(dim=-1, keepdim=True)
     s = (torch.sum(yz * xz, dim=-1, keepdim=True) /
          (torch.sum(xz * xz, dim=-1, keepdim=True) + eps)) * xz
     e = yz - s
-    num = torch.sum(s**2, dim=-1)
-    den = torch.sum(e**2, dim=-1) + eps
+    num = torch.sum(s ** 2, dim=-1)
+    den = torch.sum(e ** 2, dim=-1) + eps
     return 10.0 * torch.log10(num / den + eps)

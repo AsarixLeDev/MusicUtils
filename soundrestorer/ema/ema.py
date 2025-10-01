@@ -2,6 +2,7 @@
 import torch
 from torch import nn
 
+
 class EMA:
     def __init__(self, model: nn.Module, decay: float = 0.995):
         self.decay = float(decay)

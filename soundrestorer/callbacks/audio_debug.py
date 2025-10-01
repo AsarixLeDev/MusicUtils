@@ -2,19 +2,39 @@
 # soundrestorer/callbacks/audio_debug.py
 from __future__ import annotations
 
-import math
 import random
+import re
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict
 
 import torch
 
+from soundrestorer.callbacks.callbacks import Callback
 from soundrestorer.callbacks.utils import (
-    Triad, save_wav_triads, triad_metrics, infer_sr, ensure_sr
+    Triad, save_wav_triads, triad_metrics, infer_sr
 )
 from soundrestorer.metrics.common import match_len
 
-class AudioDebugCallback:
+
+def _slug_from_meta(batch_meta, idx: int) -> str:
+    """
+    Best-effort: get a short slug from batch['meta']['path'][idx] if present.
+    """
+    try:
+        p = batch_meta.get("path")
+        if isinstance(p, (list, tuple)):
+            p = p[idx]
+        name = Path(str(p)).stem
+    except Exception:
+        name = ""
+    if not name:
+        return ""
+    # safe slug
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+    return name[:60]  # keep short
+
+
+class AudioDebugCallback(Callback):
     """
     Save a few (clean, noisy, yhat, resid) WAV triads every epoch into:
         {run_dir}/logs/audio_debug/epXXX/{base}_{clean,noisy,yhat,resid}.wav
@@ -30,15 +50,15 @@ class AudioDebugCallback:
     """
 
     def __init__(
-        self,
-        *,
-        per_epoch: int = 3,
-        scan_batches: int = 32,
-        seed: int = 1234,
-        prefer_clean_resid: bool = True,
-        subdir: str = "logs/audio_debug",
-        sr: Optional[int] = None,
-        print_metrics: bool = True,
+            self,
+            *,
+            per_epoch: int = 3,
+            scan_batches: int = 32,
+            seed: int = 1234,
+            prefer_clean_resid: bool = True,
+            subdir: str = "logs/audio_debug",
+            sr: Optional[int] = None,
+            print_metrics: bool = True,
     ):
         self.per_epoch = int(per_epoch)
         self.scan_batches = int(scan_batches)
@@ -67,11 +87,11 @@ class AudioDebugCallback:
         self._outdir = run_dir / self.subdir / f"ep{epoch:03d}"
 
     def on_train_batch_end(
-        self,
-        trainer,
-        batch_idx: int,
-        batch: Dict[str, torch.Tensor],
-        outputs: Dict[str, torch.Tensor],
+            self,
+            trainer,
+            batch_idx: int,
+            batch: Dict[str, torch.Tensor],
+            outputs: Dict[str, torch.Tensor],
     ) -> None:
         if self._saved >= self.per_epoch:
             return
@@ -87,9 +107,9 @@ class AudioDebugCallback:
         B = yhat.shape[0] if yhat.dim() == 3 else 1
         idx = self._rng.randrange(0, B)
 
-        y_i = yhat[idx:idx+1]  # [1,C,T]
-        c_i = clean[idx:idx+1] if clean is not None else None
-        n_i = noisy[idx:idx+1] if noisy is not None else None
+        y_i = yhat[idx:idx + 1]  # [1,C,T]
+        c_i = clean[idx:idx + 1] if clean is not None else None
+        n_i = noisy[idx:idx + 1] if noisy is not None else None
 
         # collapse batch dim
         if y_i.dim() == 3: y_i = y_i[0]
@@ -105,7 +125,15 @@ class AudioDebugCallback:
         # sample rate
         sr = self.force_sr or infer_sr(trainer) or 48000
 
-        base = f"b{batch_idx}_i{idx}"
+        slug = ""
+        meta = batch.get("meta")
+        if isinstance(meta, dict):
+            slug = _slug_from_meta(meta, idx)
+
+        if slug:
+            base = f"{slug}_b{batch_idx}_i{idx}"
+        else:
+            base = f"b{batch_idx}_i{idx}"
         paths = save_wav_triads(
             self._outdir, base,
             Triad(clean=c_i, noisy=n_i, yhat=y_i, sr=sr),

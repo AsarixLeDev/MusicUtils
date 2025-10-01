@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-from typing import Dict, Any, Tuple
-import torch, torch.nn as nn
+
+from typing import Dict
+
+import torch
+import torch.nn as nn
 
 
 def _flatten_audio(x: torch.Tensor) -> torch.Tensor:

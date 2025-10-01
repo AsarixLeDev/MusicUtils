@@ -1,8 +1,14 @@
 from __future__ import annotations
-import torch, math, statistics
+
 from collections import deque
 from typing import Tuple, Optional
+
+import math
+import statistics
+import torch
+
 from ..utils.metrics import si_sdr_db, _bt
+
 
 class BatchGuard:
     """
@@ -13,6 +19,7 @@ class BatchGuard:
       - MAD outlier gate with floors + relative factor
     Has a 'relax()' rescue to soften thresholds dynamically.
     """
+
     def __init__(self,
                  hard_clip: float = 0.0,
                  window: int = 512,
@@ -21,27 +28,27 @@ class BatchGuard:
                  min_rms_db: float = -70.0,
                  max_peak: float = 1.2,
                  # robust MAD gate parameters:
-                 mad_floor_abs: float = 0.20,   # absolute MAD floor (loss units)
-                 mad_floor_rel: float = 0.20,   # relative MAD floor as fraction of |median|
-                 rel_factor: float   = 1.6,     # also require s > median * rel_factor
-                 min_hist: int       = 64):
-        self.hard_clip   = float(hard_clip)
-        self.window      = int(window)
-        self.mad_k       = float(mad_k)
-        self.snr_floor   = float(snr_floor_db)
-        self.min_rms     = 10.0 ** (min_rms_db / 20.0)
-        self.max_peak    = float(max_peak)
+                 mad_floor_abs: float = 0.20,  # absolute MAD floor (loss units)
+                 mad_floor_rel: float = 0.20,  # relative MAD floor as fraction of |median|
+                 rel_factor: float = 1.6,  # also require s > median * rel_factor
+                 min_hist: int = 64):
+        self.hard_clip = float(hard_clip)
+        self.window = int(window)
+        self.mad_k = float(mad_k)
+        self.snr_floor = float(snr_floor_db)
+        self.min_rms = 10.0 ** (min_rms_db / 20.0)
+        self.max_peak = float(max_peak)
         self.mad_floor_abs = float(mad_floor_abs)
         self.mad_floor_rel = float(mad_floor_rel)
-        self.rel_factor    = float(rel_factor)
-        self.min_hist      = int(min_hist)
+        self.rel_factor = float(rel_factor)
+        self.min_hist = int(min_hist)
 
         self.hist = deque(maxlen=self.window)
         self.enable_mad = True  # can be toggled off by trainer if needed
 
     def relax(self, factor: float = 1.25):
         """Soften the MAD gate when too many batches get skipped."""
-    #    print(f"[guard] relax: mad_k {self.mad_k:.2f}->{self.mad_k*factor:.2f}, rel_factor {self.rel_factor:.2f}->{self.rel_factor*1.05:.2f}")
+        #    print(f"[guard] relax: mad_k {self.mad_k:.2f}->{self.mad_k*factor:.2f}, rel_factor {self.rel_factor:.2f}->{self.rel_factor*1.05:.2f}")
         self.mad_k *= factor
         self.rel_factor *= 1.05
 
@@ -64,11 +71,11 @@ class BatchGuard:
 
     @torch.no_grad()
     def should_skip(
-        self,
-        batch,
-        outputs,
-        loss_value: float | None = None,
-        loss_tensor: torch.Tensor | None = None,
+            self,
+            batch,
+            outputs,
+            loss_value: float | None = None,
+            loss_tensor: torch.Tensor | None = None,
     ) -> Tuple[bool, Optional[str]]:
         # ---- loss scalar for gates (prefer tensor path; cheap CPU copy) ----
         s_mad: float | None = None
@@ -99,12 +106,14 @@ class BatchGuard:
             if isinstance(yh, torch.Tensor) and not torch.isfinite(yh).all():
                 return True, "yhat has NaN/Inf"
 
-            nm = _bt(noisy); cm = _bt(clean)
-            rms_n = torch.sqrt(torch.clamp((nm**2).mean(dim=-1), 1e-12)).mean()
-            rms_c = torch.sqrt(torch.clamp((cm**2).mean(dim=-1), 1e-12)).mean()
+            nm = _bt(noisy);
+            cm = _bt(clean)
+            rms_n = torch.sqrt(torch.clamp((nm ** 2).mean(dim=-1), 1e-12)).mean()
+            rms_c = torch.sqrt(torch.clamp((cm ** 2).mean(dim=-1), 1e-12)).mean()
             if float(rms_n) < self.min_rms or float(rms_c) < self.min_rms:
                 return True, f"too silent (rms n={float(rms_n):.2e}, c={float(rms_c):.2e})"
-            peak_n = float(torch.max(torch.abs(nm))); peak_c = float(torch.max(torch.abs(cm)))
+            peak_n = float(torch.max(torch.abs(nm)));
+            peak_c = float(torch.max(torch.abs(cm)))
             if peak_n > self.max_peak or peak_c > self.max_peak:
                 return True, f"peak too high (n={peak_n:.2f}, c={peak_c:.2f})"
 

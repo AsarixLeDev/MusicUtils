@@ -9,10 +9,12 @@ Compatible with trainer that expects keys "noisy" and "clean".
 """
 
 from __future__ import annotations
+
+import json
+import random
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Tuple
-import json, random, math
 from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple
 
 import torch
 import torchaudio
@@ -20,6 +22,18 @@ from torch.utils.data import Dataset, DataLoader
 
 from ..utils.audio import to_mono
 from ..utils.metrics import rms_db
+from soundrestorer.utils.audio import ensure_3d
+from soundrestorer.utils.metrics import rms_db as _rms_db
+
+def _rms_db_float(x: torch.Tensor) -> float:
+    """
+    Robust RMS dB as a plain Python float for any shape [T]/[C,T]/[B,C,T].
+    Averages across channels/items so the result is scalar.
+    """
+    x3 = ensure_3d(x)                 # -> [B,C,T]
+    val = _rms_db(x3, dim=(-1,-2))    # dB per item [B]
+    return float(val.mean().detach().cpu().item())
+
 
 # ------------------- small helpers -------------------
 
@@ -35,13 +49,16 @@ def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
                 pass
     return rows
 
+
 def _rms(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     return torch.sqrt(torch.clamp(torch.mean(x ** 2), min=eps))
+
 
 def _resample_if_needed(wav: torch.Tensor, sr: int, target_sr: int) -> torch.Tensor:
     if sr == target_sr:
         return wav
     return torchaudio.functional.resample(wav, sr, target_sr)
+
 
 def _crop_or_pad(wav: torch.Tensor, target_len: int, rng: random.Random) -> torch.Tensor:
     # wav: (1, T)
@@ -56,12 +73,14 @@ def _crop_or_pad(wav: torch.Tensor, target_len: int, rng: random.Random) -> torc
     wav2 = wav.repeat(1, reps)[..., :target_len]
     return wav2
 
+
 def _peak_scale_pair(noisy: torch.Tensor, clean: torch.Tensor, peak: float = 0.98) -> Tuple[torch.Tensor, torch.Tensor]:
     peak_now = max(noisy.abs().amax().item(), 1e-9)
     if peak_now <= peak:
         return noisy, clean
     scale = peak / peak_now
     return noisy * scale, clean * scale
+
 
 # ------------------- dataset -------------------
 
@@ -75,8 +94,9 @@ class MusicDenoiseCfg:
     use_ext_noise_p: float = 0.6
     p_clean: float = 0.05
     out_peak: float = 0.98
-    silence_rms_db: float = -60.0      # reject overly silent crops
+    silence_rms_db: float = -60.0  # reject overly silent crops
     max_silence_retries: int = 6
+
 
 class MusicDenoiseDataset(Dataset):
     def __init__(self,
@@ -90,16 +110,16 @@ class MusicDenoiseDataset(Dataset):
 
         # parse cfg
         self.cfg = MusicDenoiseCfg(
-            sr               = int(cfg_data.get("sr", 48000)),
-            crop             = float(cfg_data.get("crop", 3.0)),
-            mono             = bool(cfg_data.get("mono", True)),
-            snr_min          = float(cfg_data.get("snr_min", 0.0)),
-            snr_max          = float(cfg_data.get("snr_max", 20.0)),
-            use_ext_noise_p  = float(cfg_data.get("use_ext_noise_p", 0.6)),
-            p_clean          = float(cfg_data.get("p_clean", 0.05)),
-            out_peak         = float(cfg_data.get("out_peak", 0.98)),
-            silence_rms_db   = float(cfg_data.get("silence_rms_db", -60.0)),
-            max_silence_retries = int(cfg_data.get("max_silence_retries", 6)),
+            sr=int(cfg_data.get("sr", 48000)),
+            crop=float(cfg_data.get("crop", 3.0)),
+            mono=bool(cfg_data.get("mono", True)),
+            snr_min=float(cfg_data.get("snr_min", 0.0)),
+            snr_max=float(cfg_data.get("snr_max", 20.0)),
+            use_ext_noise_p=float(cfg_data.get("use_ext_noise_p", 0.6)),
+            p_clean=float(cfg_data.get("p_clean", 0.05)),
+            out_peak=float(cfg_data.get("out_peak", 0.98)),
+            silence_rms_db=float(cfg_data.get("silence_rms_db", -60.0)),
+            max_silence_retries=int(cfg_data.get("max_silence_retries", 6)),
         )
 
         # optional noise rows
@@ -126,7 +146,7 @@ class MusicDenoiseDataset(Dataset):
         # retry a few times to avoid silent segments if possible
         for _ in range(self.cfg.max_silence_retries):
             crop = _crop_or_pad(wav, T_target, self.rng)
-            if rms_db(crop) > self.cfg.silence_rms_db:
+            if _rms_db_float(crop) > self.cfg.silence_rms_db:
                 return crop
         return _crop_or_pad(wav, T_target, self.rng)
 
@@ -186,7 +206,7 @@ class MusicDenoiseDataset(Dataset):
             # try not-silent crop
             for _ in range(self.cfg.max_silence_retries):
                 crop = _crop_or_pad(wav_clean, T_target, self.rng)
-                if rms_db(crop) > self.cfg.silence_rms_db:
+                if _rms_db_float(crop) > self.cfg.silence_rms_db:
                     wav_clean = crop
                     break
             else:
@@ -207,6 +227,7 @@ class MusicDenoiseDataset(Dataset):
                 "path": row.get("clean"),
             }
         }
+
 
 # ------------------- Loader builder -------------------
 

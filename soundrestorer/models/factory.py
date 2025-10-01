@@ -1,21 +1,26 @@
 # soundrestorer/models/factory.py
 from __future__ import annotations
-import importlib, inspect
+
+import importlib
+import inspect
 from types import ModuleType
-from typing import Any, Dict, List, Optional, Callable
+from typing import Any, Optional, Callable
+
 import torch.nn as nn
 
 # Friendly aliases so config names resolve to your real modules/classes
 MODEL_ALIASES = {
     # name_in_config : (module_path, class_name)
     "complex_unet_auto": ("soundrestorer.models.auto", "AutoComplexUNet"),
-    "complex_unet":      ("soundrestorer.models.complex_unet", "ComplexUNetWrapper"),
+    "complex_unet": ("soundrestorer.models.complex_unet", "ComplexUNetWrapper"),
     "complex_unet_lstm": ("soundrestorer.models.complex_unet_lstm", "ComplexUNetLSTM"),
-    "music_unet":        ("soundrestorer.models.music_unet", "MusicUNet"),
+    "music_unet": ("soundrestorer.models.music_unet", "MusicUNet"),
 }
+
 
 def _import_module(path: str) -> ModuleType:
     return importlib.import_module(path)
+
 
 def _ctor_from_module(mod: ModuleType) -> Optional[Callable[..., Any]]:
     # Prefer a factory function if present
@@ -30,13 +35,16 @@ def _ctor_from_module(mod: ModuleType) -> Optional[Callable[..., Any]]:
             candidates.append(obj)
     if not candidates:
         return None
+
     # simple ranking: model-ish names first
     def _rank(cls):
         n = cls.__name__.lower()
         score = sum(k in n for k in ("unet", "denoise", "denoiser", "net", "model"))
         return (-score, len(n))
+
     candidates.sort(key=_rank)
     return candidates[0]
+
 
 def create_model(name_or_cfg: Any, **kwargs) -> nn.Module:
     """
@@ -64,9 +72,9 @@ def create_model(name_or_cfg: Any, **kwargs) -> nn.Module:
     # 2) Heuristic tries: soundrestorer.models.<name> etc.
     attempts = []
     for cand in (
-        f"soundrestorer.models.{name}",
-        f"soundrestorer.models.{name.replace('-', '_')}",
-        name,  # fully-qualified path case
+            f"soundrestorer.models.{name}",
+            f"soundrestorer.models.{name.replace('-', '_')}",
+            name,  # fully-qualified path case
     ):
         try:
             mod = _import_module(cand)

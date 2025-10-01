@@ -1,18 +1,23 @@
 # -*- coding: utf-8 -*-
 # soundrestorer/utils/signal.py
 from __future__ import annotations
-from typing import Optional, Tuple
+
+from typing import Optional
+
 import torch
-import torch.nn.functional as F
+
 
 def db_to_amp(db: torch.Tensor) -> torch.Tensor:
     return (10.0 ** (db / 20.0))
 
+
 def amp_to_db(amp: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return 20.0 * torch.log10(amp.clamp_min(eps))
 
+
 def pow_to_db(power: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     return 10.0 * torch.log10(power.clamp_min(eps))
+
 
 def add_noise_at_snr(clean: torch.Tensor, noise: torch.Tensor, snr_db: float, eps: float = 1e-8) -> torch.Tensor:
     """
@@ -35,10 +40,11 @@ def add_noise_at_snr(clean: torch.Tensor, noise: torch.Tensor, snr_db: float, ep
     scale = scale.view(B, 1, 1)
     return c3 + n3 * scale
 
+
 def stft_complex(
-    x: torch.Tensor, n_fft: int = 1024, hop_length: Optional[int] = None,
-    win_length: Optional[int] = None, window: Optional[torch.Tensor] = None,
-    center: bool = True, pad_mode: str = "reflect",
+        x: torch.Tensor, n_fft: int = 1024, hop_length: Optional[int] = None,
+        win_length: Optional[int] = None, window: Optional[torch.Tensor] = None,
+        center: bool = True, pad_mode: str = "reflect",
 ) -> torch.Tensor:
     """
     Wrapper around torch.stft that returns complex tensor shape [..., F, T].
@@ -58,10 +64,11 @@ def stft_complex(
     Fbins, Frames = X.shape[-2], X.shape[-1]
     return X.view(B, C, Fbins, Frames)
 
+
 def istft_complex(
-    X: torch.Tensor, n_fft: int = 1024, hop_length: Optional[int] = None,
-    win_length: Optional[int] = None, window: Optional[torch.Tensor] = None,
-    length: Optional[int] = None, center: bool = True,
+        X: torch.Tensor, n_fft: int = 1024, hop_length: Optional[int] = None,
+        win_length: Optional[int] = None, window: Optional[torch.Tensor] = None,
+        length: Optional[int] = None, center: bool = True,
 ) -> torch.Tensor:
     """
     Inverse STFT for complex input [..., F, T]. Returns [B, C, T].

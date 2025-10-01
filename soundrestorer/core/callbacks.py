@@ -1,165 +1,17 @@
 from __future__ import annotations
 
 import os
-import random
-from typing import Optional
-
 import torch
 
 from .trainer import Callback
-from ..ema.ema import EMA
-from ..mining.hard_miner import HardMiner, MutableWeightedSampler
 from ..utils.noise import NoiseFactory, mix_at_snr
-
-
-class EMACallback(Callback):
-    """Legacy EMA (update on batch_end; swap for val). Prefer EmaUpdateCallback + EmaEvalSwap."""
-    def __init__(self, model, decay=0.999):
-        self.ema = EMA(model, decay=float(decay))
-        self._backup = None
-
-    def on_batch_end(self, trainer=None, **_):
-        self.ema.update(trainer.model)
-
-    def on_val_start(self, trainer=None, **_):
-        m = trainer.model
-        self._backup = {k: v.detach().clone() for k, v in m.state_dict().items()}
-        self.ema.apply_to(m)
-
-    def on_val_end(self, trainer=None, **_):
-        if self._backup:
-            trainer.model.load_state_dict(self._backup)
-            self._backup = None
-
-
-class CheckpointCallback(Callback):
-    def __init__(self, out_dir: str, every: int = 1):
-        self.out = out_dir
-        self.every = int(every)
-        os.makedirs(self.out, exist_ok=True)
-
-    def on_epoch_end(self, trainer=None, state=None, **_):
-        if (state.epoch % self.every) != 0:
-            return
-        p = os.path.join(self.out, f"epoch_{state.epoch:03d}.pt")
-        torch.save({
-            "model": trainer.model.state_dict(),
-            "opt": trainer.opt.state_dict(),
-            "sched": getattr(trainer.sched, "state_dict", lambda: {})(),
-            "epoch": state.epoch, "global_step": state.global_step
-        }, p)
-        print(f"[ckpt] saved {p}")
-
-
-class ConsoleLogger(Callback):
-    def on_val_end(self, state=None, train_loss=None, val_loss=None,
-                   train_comps=None, val_comps=None, train_used=None,
-                   train_skipped=None, epoch_time=None, trainer=None, **_):
-        lr_now = trainer.opt.param_groups[0]['lr'] if trainer else 0.0
-        comps_str = ""
-        if isinstance(train_comps, dict) and train_comps:
-            comps_str = " | " + " ".join(f"{k}={v:.4f}" for k, v in sorted(train_comps.items()))
-        print(f"[epoch {state.epoch:03d}] train {train_loss:.4f} | val {val_loss:.4f} "
-              f"| used {train_used} | skip {train_skipped} | lr {lr_now:.2e} "
-              f"| {epoch_time:.1f}s{comps_str}")
-
-
-class HardMiningCallback(Callback):
-    """
-    Uses per-sample proxy from task (or computes L1) to update a mutable weighted sampler.
-    """
-    def __init__(self, dataset, sampler: Optional[MutableWeightedSampler],
-                 start_epoch=3, ema=0.9, top_frac=0.3, boost=4.0, baseline=1.0):
-        self.dataset = dataset
-        self.sampler = sampler
-        self.start_epoch = int(start_epoch)
-        self.miner = HardMiner(ema=ema, top_frac=top_frac, boost=boost, baseline=baseline)
-
-    def on_batch_end(self, per_sample=None, outputs=None, **_):
-        if per_sample is None:
-            return
-        ids = outputs.get("ids", None) if isinstance(outputs, dict) else None
-        self.miner.update_batch(ids, per_sample)
-
-    def on_epoch_end(self, state=None, **_):
-        if not self.sampler or state.epoch < self.start_epoch:
-            return
-        w = self.miner.make_weights(self.dataset)
-        self.sampler.set_weights(w)
-        print("[hard-mining] sampler weights updated.")
-
-
-class ProcNoiseAugmentCallback(Callback):
-    """
-    Replaces batch noisy = clean + procedural_noise at random, on-the-fly.
-    Works without modifying your dataset. Train-only by default.
-    Now tracks how many items were replaced to report the true fraction.
-    """
-    def __init__(self, sr, prob=0.5, snr_min=0.0, snr_max=20.0, out_peak=0.98,
-                 train_only=True, noise_cfg=None, track_stats: bool = True):
-        self.sr = int(sr)
-        self.prob = float(prob)
-        self.snr_min = float(snr_min)
-        self.snr_max = float(snr_max)
-        self.out_peak = float(out_peak)
-        self.train_only = bool(train_only)
-        self.noise = NoiseFactory(self.sr, noise_cfg or {})
-        self.track = bool(track_stats)
-        self._seen = 0
-        self._repl = 0
-
-    def on_epoch_start(self, **_):
-        self._seen = 0
-        self._repl = 0
-
-    def on_batch_start(self, trainer=None, state=None, batch=None, **_):
-        if self.train_only and trainer.model.training is False:
-            return
-        if not (isinstance(batch, (list, tuple)) and len(batch) >= 2):
-            return
-        noisy, clean = batch[0], batch[1]
-        device = clean.device
-        B, T = clean.shape[0], clean.shape[-1]
-        if self.track:
-            self._seen += B
-
-        import random
-        # coin toss per-batch: if success, rebuild entire noisy batch
-        if random.random() > self.prob:
-            return
-
-        # procedural noise
-        noises = self.noise.sample_batch(B, T, device=device)  # (B,T)
-        snrs = torch.empty(B, device=device).uniform_(self.snr_min, self.snr_max)
-        new_noisy_bt = mix_at_snr(clean, noises, snrs, peak=self.out_peak)  # (B,T)
-
-        # broadcast to match original 'noisy' shape and do in-place copy
-        if noisy.dim() == 2:  # (B,T)
-            noisy.copy_(new_noisy_bt)
-        elif noisy.dim() == 3:  # (B,C,T)
-            noisy.copy_(new_noisy_bt.unsqueeze(1).expand(-1, noisy.shape[1], -1))
-        else:
-            raise RuntimeError(f"Unexpected noisy shape {tuple(noisy.shape)}")
-
-        if self.track:
-            self._repl += B
-
-    def on_epoch_end(self, trainer=None, state=None, **_):
-        if not self.track or self._seen == 0:
-            return
-        frac = self._repl / float(self._seen)
-        print(f"[proc-noise] epoch {state.epoch}: replaced {self._repl}/{self._seen} items ({frac*100:.1f}%)")
-        try:
-            trainer.state.info["proc_noise_frac"] = frac
-        except Exception:
-            pass
 
 class CurriculumCallback(Callback):
     def __init__(self, loss_fn, task, dataset=None,
                  snr_stages=None, sisdr=None, mask_limit=None,
                  mask_variant=None,
-                 mask_reg=None,          # <— NEW: schedule weight for mask_unity_reg
-                 sisdr_weight=None):     # <— NEW: schedule sisdr_ratio weight
+                 mask_reg=None,  # <— NEW: schedule weight for mask_unity_reg
+                 sisdr_weight=None):  # <— NEW: schedule sisdr_ratio weight
         self.loss_fn = loss_fn
         self.task = task
         self.dataset = dataset
@@ -213,7 +65,7 @@ class CurriculumCallback(Callback):
         # mask_limit schedule on task
         if self.mask_limit and hasattr(self.task, "mask_limit"):
             m0 = float(self.mask_limit.get("start", 1.5))
-            m1 = float(self.mask_limit.get("end",   2.5))
+            m1 = float(self.mask_limit.get("end", 2.5))
             e1 = int(self.mask_limit.get("end_epoch", 20))
             t = min(1.0, max(0.0, (e - 1) / max(1, e1 - 1)))
             target = (1.0 - t) * m0 + t * m1
@@ -260,154 +112,6 @@ class CurriculumCallback(Callback):
                         self.task.mask_variant = v
                         print(f"[curriculum] epoch {e}: mask_variant -> {v}")
                     break
-
-
-class AudioDebugCallback(Callback):
-    """
-    Save a few (noisy, yhat, clean, resid_true) triads from *validation*,
-    but pick items that are actually useful to listen to:
-      - not (almost) silent
-      - "noisy" has SNR(noisy, clean) below a threshold (i.e., genuinely noisy)
-
-    It samples random indices from the val dataset up to `scan_tries` to find `num` items
-    that pass filters, then runs the model once on that mini-batch and saves WAVs.
-    """
-    def __init__(self, out_dir: str, val_dataset, task, sr=48000,
-                 every=5, num_items=3,
-                 min_noisy_snr_db: float = 25.0,   # exclude "noisy" that is cleaner than this
-                 max_silence_frac: float = 0.95,   # exclude files >95% near-zero
-                 scan_tries: int = 400,            # how many random indices to try to find `num_items`
-                 seed: int = 1234):
-        import os, random
-        self.out = os.path.join(out_dir, "audio_debug"); os.makedirs(self.out, exist_ok=True)
-        self.ds = val_dataset; self.task = task
-        self.sr = int(sr); self.every = int(every); self.num = int(num_items)
-        self.min_snr_db = float(min_noisy_snr_db)
-        self.max_sil = float(max_silence_frac)
-        self.scan_tries = int(scan_tries)
-        self._rng = random.Random(seed)
-
-    # small helpers on numpy/torch without imports churn
-    def _np_to_ct(self, x):
-        import torch, numpy as np
-        if isinstance(x, torch.Tensor):
-            t = x
-        else:
-            # x is numpy, make sure it's contiguous
-            t = torch.from_numpy(x.copy() if hasattr(x, "flags") and not x.flags.c_contiguous else x)
-        t = t.to(torch.float32)
-        if t.dim() == 1:  # (T,) -> (1,T)
-            t = t.unsqueeze(0)
-        elif t.dim() == 2:  # (C,T)
-            pass
-        else:
-            raise RuntimeError(f"Unexpected item shape {tuple(t.shape)}")
-        return t.contiguous()
-
-    def _mono_bt(self, t):
-        # torch (C,T) or (T,) -> (T,)
-        if t.dim() == 2:  # (C,T)
-            return t.mean(dim=0)
-        return t
-
-    def _rms_dbfs(self, x, eps=1e-12):
-        import torch
-        rms = torch.sqrt(torch.mean(x**2) + eps)
-        return float(20.0 * torch.log10(rms + eps))
-
-    def _sil_frac(self, x, thr_dbfs=-60.0):
-        import torch
-        thr = 10.0 ** (thr_dbfs / 20.0)
-        return float((torch.abs(x) < thr).float().mean())
-
-    def _snr_noisy_clean_db(self, noisy, clean, eps=1e-12):
-        import torch
-        # both mono 1D, same length
-        n = min(noisy.numel(), clean.numel())
-        noisy = noisy[:n]; clean = clean[:n]
-        num = torch.sum(clean**2).clamp_min(eps)
-        den = torch.sum((noisy - clean)**2).clamp_min(eps)
-        return float(10.0 * torch.log10(num / den))
-
-    @torch.no_grad()
-    def on_epoch_end(self, trainer=None, state=None, **_):
-        if (state.epoch % self.every) != 0: return
-        try:
-            import torchaudio, torch
-        except Exception:
-            print("[audio-debug] torchaudio/torch not available; skipping")
-            return
-
-        # sample candidate indices at random and filter
-        N = len(self.ds)
-        picks = []
-        tries = 0
-        while len(picks) < self.num and tries < self.scan_tries:
-            i = self._rng.randrange(0, N)
-            item = self.ds[i]
-            # item expected: (noisy, clean, ...)
-            if not (isinstance(item, (list, tuple)) and len(item) >= 2):
-                tries += 1; continue
-            noisy_ct = self._np_to_ct(item[0])  # (C,T)
-            clean_ct = self._np_to_ct(item[1])  # (C,T)
-            # make quick mono 1D
-            noisy_m = self._mono_bt(noisy_ct)
-            clean_m = self._mono_bt(clean_ct)
-
-            # silence/clean filters
-            if self._sil_frac(clean_m) > self.max_sil or self._sil_frac(noisy_m) > self.max_sil:
-                tries += 1; continue
-            snr = self._snr_noisy_clean_db(noisy_m, clean_m)
-            if snr > self.min_snr_db:
-                # too clean to be useful listening example
-                tries += 1; continue
-
-            picks.append((i, noisy_ct, clean_ct, snr))
-            tries += 1
-
-        if not picks:
-            print("[audio-debug] no suitable items after scan; saving first few indices as fallback")
-            picks = []
-            for i in range(min(self.num, len(self.ds))):
-                item = self.ds[i]
-                if not (isinstance(item, (list, tuple)) and len(item) >= 2): continue
-                picks.append((i, self._np_to_ct(item[0]), self._np_to_ct(item[1]), None))
-
-        # stack and run the model once
-        dev = next(trainer.model.parameters()).device
-        was_train = trainer.model.training
-        trainer.model.eval()
-
-        noisy_ct = torch.stack([p[1] for p in picks], dim=0).to(dev, non_blocking=True)   # (B,C,T)
-        clean_ct = torch.stack([p[2] for p in picks], dim=0).to(dev, non_blocking=True)   # (B,C,T)
-        batch = [noisy_ct, clean_ct]
-
-        with torch.autocast(device_type=("cuda" if dev.type == "cuda" else "cpu"),
-                            dtype=torch.bfloat16 if dev.type == "cuda" else torch.float32, enabled=True):
-            outputs, _ = self.task.step(trainer.model, batch)
-        yhat_bt = outputs["yhat"].detach().to(torch.float32).cpu()   # (B,T) or (B,1,T)->(B,T)
-
-        if yhat_bt.dim() == 3 and yhat_bt.size(1) == 1:
-            yhat_bt = yhat_bt[:, 0, :]
-
-        # save files
-        for k, (idx, noisy_k, clean_k, snr_k) in enumerate(picks):
-            base = os.path.join(self.out, f"ep{state.epoch:03d}_idx{idx:06d}")
-            # torchaudio expects (C,T)
-            torchaudio.save(base + "_noisy.wav", noisy_k.cpu(), self.sr)
-            torchaudio.save(base + "_clean.wav", clean_k.cpu(), self.sr)
-            # select yhat by k
-            yhat_k = yhat_bt[k].unsqueeze(0)  # (1,T)
-            torchaudio.save(base + "_yhat.wav", yhat_k, self.sr)
-            # also save true residual (noisy-clean)
-            resid_true = (self._mono_bt(noisy_k) - self._mono_bt(clean_k)).unsqueeze(0)
-            torchaudio.save(base + "_resid.wav", resid_true, self.sr)
-
-            if snr_k is not None:
-                print(f"[audio-debug] saved ep{state.epoch:03d} idx={idx} with SNR(noisy,clean)={snr_k:+.2f} dB")
-
-        if was_train: trainer.model.train()
-        print(f"[audio-debug] saved {len(picks)} triads at epoch {state.epoch}")
 
 
 class BestCheckpointCallback(Callback):
@@ -485,276 +189,13 @@ class EarlyStoppingCallback(Callback):
                 print(f"[early-stop] no improvement for {self.patience} evals. Stopping.")
 
 
-class EpochSeedCallback(Callback):
-    def __init__(self, datasets):
-        self.datasets = [d for d in (datasets if isinstance(datasets, (list, tuple)) else [datasets]) if d is not None]
-
-    def on_epoch_start(self, state=None, **_):
-        seed = 1234 + state.epoch
-        import numpy as np, random as _random, torch as _torch
-        _random.seed(seed); np.random.seed(seed); _torch.manual_seed(seed)
-        for ds in self.datasets:
-            if hasattr(ds, "set_epoch"):
-                ds.set_epoch(state.epoch)
-
-
-class EmaUpdateCallback(Callback):
-    """Keeps EMA weights up-to-date during training."""
-    def __init__(self, ema):
-        self.ema = ema
-
-    @torch.no_grad()
-    def on_batch_end(self, trainer=None, **_):
-        self.ema.update(trainer.model)
-
-
-class EmaEvalSwap(Callback):
-    """
-    Swap live model weights with EMA for validation, then restore.
-    The actual load_state_dict copies are done under `torch.inference_mode()`
-    to allow in-place writes on inference-tagged storages.
-    """
-    def __init__(self, ema_obj, enable: bool = True):
-        self.ema = ema_obj
-        self.enable = bool(enable)
-        self._backup = None
-        self._was_training = None
-
-    @torch.no_grad()
-    def on_val_start(self, trainer=None, **_):
-        if not self.enable or self.ema is None:
-            return
-        self._was_training = trainer.model.training
-        # CPU backup to avoid inference flag issues
-        self._backup = {k: v.detach().cpu().clone() for k, v in trainer.model.state_dict().items()}
-        dev = next(trainer.model.parameters()).device
-        ema_sd = {k: v.detach().to(dev) for k, v in self.ema.state_dict().items()}
-        with torch.inference_mode():
-            trainer.model.load_state_dict(ema_sd, strict=False)
-        trainer.model.eval()
-
-    @torch.no_grad()
-    def on_val_end(self, trainer=None, **_):
-        if self._backup is None:
-            return
-        dev = next(trainer.model.parameters()).device
-        orig_sd = {k: v.to(dev) for k, v in self._backup.items()}
-        with torch.inference_mode():
-            trainer.model.load_state_dict(orig_sd, strict=False)
-        trainer.model.train(self._was_training is True)
-        self._backup = None
-        self._was_training = None
-
-
-
-class DataAuditCallback(Callback):
-    """
-    Train-time saver: write a few (noisy, clean, resid_true) WAV triads + CSV with metrics.
-    Filters out silent & too-clean items and uses *shared* normalization per triad so SNR remains audible.
-
-    IMPORTANT: put this callback AFTER ProcNoiseAugmentCallback and EnsureMinSNRCallback
-    so we audit the post-augment 'noisy'.
-    """
-    def __init__(self, out_dir: str, sr: int = 48000,
-                 first_epochs: int = 1,
-                 max_batches: int = 3,
-                 max_items: int = 12,
-                 max_keep_snr_db: float = 25.0,   # keep items with SNR(noisy,clean) ≤ this
-                 max_silence_frac: float = 0.95,  # drop items with >95% near-zero
-                 normalize_peak_dbfs: float = -1.0,  # shared peak for (noisy,clean,resid)
-                 save_csv: bool = True,
-                 emph_snr_db: float | None = None  # OPTIONAL: also save noisy mixed to target SNR (e.g., 12.0)
-                 ):
-        import os
-        self.sr = int(sr)
-        self.first_epochs = int(first_epochs)
-        self.max_batches = int(max_batches)
-        self.max_items = int(max_items)
-        self.max_keep_snr_db = float(max_keep_snr_db)
-        self.max_silence_frac = float(max_silence_frac)
-        self.normalize_peak_dbfs = float(normalize_peak_dbfs)
-        self.save_csv = bool(save_csv)
-        self.emph_snr_db = (float(emph_snr_db) if emph_snr_db is not None else None)
-        self.root = os.path.join(out_dir, "data_audit"); os.makedirs(self.root, exist_ok=True)
-
-        self._epoch_dir = None
-        self._batch_seen = 0
-        self._saved = 0
-        self._rows = []
-
-    # ----- helpers -----
-    def _bt_mono(self, t):
-        import torch
-        # (B,C,T)->(B,T), (B,T)->(B,T), (T,)->(1,T)
-        if t.dim() == 1: return t.unsqueeze(0)
-        if t.dim() == 3: return t.mean(dim=1)
-        if t.dim() == 2: return t
-        raise RuntimeError(f"Unexpected tensor shape {tuple(t.shape)}")
-
-    def _rms_dbfs(self, x, eps=1e-12):
-        import torch
-        rms = torch.sqrt(torch.mean(x**2) + eps)
-        return float(20.0 * torch.log10(rms + eps))
-
-    def _peak(self, x):
-        import torch
-        return float(torch.max(torch.abs(x)))
-
-    def _peak_dbfs(self, x, eps=1e-12):
-        import torch
-        peak = torch.max(torch.abs(x))
-        return float(20.0 * torch.log10(peak + eps))
-
-    def _silence_frac(self, x, thr_dbfs=-60.0):
-        import torch
-        thr = 10.0 ** (thr_dbfs / 20.0)
-        return float((torch.abs(x) < thr).float().mean())
-
-    def _snr_db(self, clean_bt, noisy_bt, eps=1e-12):
-        import torch
-        n = min(clean_bt.shape[-1], noisy_bt.shape[-1])
-        c = clean_bt[..., :n]; y = noisy_bt[..., :n]
-        num = (c**2).sum(dim=-1).clamp_min(eps)
-        den = ((y - c)**2).sum(dim=-1).clamp_min(eps)
-        return 10.0 * torch.log10(num/den)  # (B,)
-
-    def _shared_norm(self, n_1d, c_1d, r_1d, target_dbfs=-1.0):
-        import torch
-        peak = max(self._peak(n_1d), self._peak(c_1d), self._peak(r_1d))
-        if peak <= 0: return n_1d, c_1d, r_1d
-        tgt = 10.0**(target_dbfs/20.0)
-        g = tgt / peak
-        return n_1d * g, c_1d * g, r_1d * g
-
-    def _mix_to_target_snr(self, clean_1d, resid_1d, target_snr_db: float, eps=1e-12):
-        """
-        Return noisy_tgt = clean + alpha*resid where SNR(clean, noisy_tgt) ≈ target_snr_db.
-        """
-        import torch, math
-        Pc = torch.mean(clean_1d**2).clamp_min(eps)
-        Pr = torch.mean(resid_1d**2).clamp_min(eps)
-        alpha = torch.sqrt(Pc / (Pr * (10.0**(target_snr_db/10.0))))
-        return clean_1d + alpha * resid_1d
-
-    # ----- lifecycle -----
-    def on_epoch_start(self, trainer=None, state=None, **_):
-        import os
-        if state.epoch <= self.first_epochs:
-            self._epoch_dir = os.path.join(self.root, f"ep{state.epoch:03d}")
-            os.makedirs(self._epoch_dir, exist_ok=True)
-            self._batch_seen = 0
-            self._saved = 0
-            self._rows = []
-            print(f"[data-audit] will save up to {self.max_items} items from {self.max_batches} batches -> {self._epoch_dir}")
-        else:
-            self._epoch_dir = None
-
-    @torch.no_grad()
-    def on_batch_start(self, trainer=None, state=None, batch=None, **_):
-        if self._epoch_dir is None: return
-        if self._batch_seen >= self.max_batches or self._saved >= self.max_items: return
-        self._batch_seen += 1
-
-        try:
-            import torchaudio, torch
-        except Exception:
-            print("[data-audit] torchaudio/torch not available; skipping")
-            return
-
-        if not (isinstance(batch, (list, tuple)) and len(batch) >= 2): return
-
-        noisy = batch[0].detach().to(torch.float32)
-        clean = batch[1].detach().to(torch.float32)
-
-        noisy_bt = self._bt_mono(noisy)   # (B,T)
-        clean_bt = self._bt_mono(clean)   # (B,T)
-        B, T = noisy_bt.shape
-        dur = float(T) / float(self.sr)
-
-        snr = self._snr_db(clean_bt, noisy_bt)  # (B,)
-        sil_n = torch.tensor([self._silence_frac(noisy_bt[i]) for i in range(B)])
-        sil_c = torch.tensor([self._silence_frac(clean_bt[i]) for i in range(B)])
-
-        for i in range(B):
-            if self._saved >= self.max_items: break
-            # filters
-            if sil_n[i] > self.max_silence_frac or sil_c[i] > self.max_silence_frac:
-                continue
-            if float(snr[i]) > self.max_keep_snr_db:
-                continue
-
-            base = os.path.join(self._epoch_dir, f"b{self._batch_seen:02d}_i{i:02d}_SNR{float(snr[i]):+.1f}dB")
-
-            # signals (1D mono)
-            n_m = noisy_bt[i].clone()
-            c_m = clean_bt[i].clone()
-            r_m = (n_m - c_m)
-
-            # shared normalization (keeps SNR perceptible)
-            if self.normalize_peak_dbfs is not None:
-                n_m, c_m, r_m = self._shared_norm(n_m, c_m, r_m, self.normalize_peak_dbfs)
-
-            # optional emphasized version at target SNR for quick listening
-            if self.emph_snr_db is not None:
-                n_tgt = self._mix_to_target_snr(c_m, r_m, float(self.emph_snr_db))
-                # use the same shared peak again (with r_m unchanged) so loudness comparable
-                if self.normalize_peak_dbfs is not None:
-                    n_tgt, c_tgt, r_tgt = self._shared_norm(n_tgt, c_m, r_m, self.normalize_peak_dbfs)
-                else:
-                    n_tgt, c_tgt, r_tgt = n_tgt, c_m, r_m
-
-            # save audio
-            try:
-                torchaudio.save(base + "_noisy.wav", n_m.unsqueeze(0).cpu(), self.sr)
-                torchaudio.save(base + "_clean.wav", c_m.unsqueeze(0).cpu(), self.sr)
-                torchaudio.save(base + "_resid.wav", r_m.unsqueeze(0).cpu(), self.sr)
-                if self.emph_snr_db is not None:
-                    torchaudio.save(base + f"_noisy_tgtSNR{int(self.emph_snr_db)}dB.wav",
-                                    n_tgt.unsqueeze(0).cpu(), self.sr)
-            except Exception as e:
-                print(f"[data-audit] save failed: {e}")
-                continue
-
-            # CSV row
-            row = dict(
-                epoch=state.epoch, batch=self._batch_seen, idx=i,
-                dur_s=dur,
-                snr_db=float(snr[i]),
-                rms_noisy_dbfs=self._rms_dbfs(noisy_bt[i]),
-                rms_clean_dbfs=self._rms_dbfs(clean_bt[i]),
-                peak_noisy_dbfs=self._peak_dbfs(noisy_bt[i]),
-                peak_clean_dbfs=self._peak_dbfs(clean_bt[i]),
-                silence_noisy_frac=float(sil_n[i]),
-                silence_clean_frac=float(sil_c[i]),
-            )
-            self._rows.append(row)
-            self._saved += 1
-
-    def on_epoch_end(self, trainer=None, state=None, **_):
-        if self._epoch_dir is None: return
-        import csv, os, numpy as np
-        if self._rows:
-            snrs = np.array([r["snr_db"] for r in self._rows], dtype=float)
-            sil = np.array([r["silence_noisy_frac"] for r in self._rows], dtype=float)
-            print(f"[data-audit] saved {len(self._rows)} items | SNR mean {snrs.mean():+.2f} dB "
-                  f"(min {snrs.min():+.2f}, max {snrs.max():+.2f}) | noisy_sil>95% count {(sil>0.95).sum()}")
-            if self.save_csv:
-                csv_path = os.path.join(self._epoch_dir, "audit.csv")
-                with open(csv_path, "w", newline="") as f:
-                    w = csv.DictWriter(f, fieldnames=list(self._rows[0].keys()))
-                    w.writeheader()
-                    for r in self._rows:
-                        w.writerow(r)
-                print(f"[data-audit] wrote {csv_path}")
-
-
-
 class EnsureMinSNRCallback(Callback):
     """
     Per-item rescue: if SNR(noisy, clean) is above min_snr_db (too clean),
     inject procedural noise to bring it into a target SNR window.
     Train-only by default; does *not* touch validation unless you set train_only=False.
     """
+
     def __init__(self, sr: int, min_snr_db: float = 25.0,
                  snr_min: float = 4.0, snr_max: float = 20.0,
                  out_peak: float = 0.98, train_only: bool = True):
@@ -781,11 +222,15 @@ class EnsureMinSNRCallback(Callback):
         if not (isinstance(batch, (list, tuple)) and len(batch) >= 2):
             return
         noisy, clean = batch[0], batch[1]
+
         # to (B,T) mono float32 on-device
         def _bt(t):
-            if t.dim() == 3: t = t.mean(dim=1)
-            elif t.dim() == 1: t = t.unsqueeze(0)
+            if t.dim() == 3:
+                t = t.mean(dim=1)
+            elif t.dim() == 1:
+                t = t.unsqueeze(0)
             return t
+
         noisy_bt = _bt(noisy).to(torch.float32)
         clean_bt = _bt(clean).to(torch.float32)
 
@@ -795,7 +240,7 @@ class EnsureMinSNRCallback(Callback):
         # SNR(noisy vs clean) ~ 10*log10(||clean||^2 / ||noisy-clean||^2)
         resid = noisy_bt - clean_bt
         num = (clean_bt ** 2).sum(dim=-1).clamp_min(1e-12)
-        den = (resid    ** 2).sum(dim=-1).clamp_min(1e-12)
+        den = (resid ** 2).sum(dim=-1).clamp_min(1e-12)
         snr_db = 10.0 * torch.log10(num / den)
 
         # Items to fix
@@ -827,9 +272,8 @@ class EnsureMinSNRCallback(Callback):
         if self._seen > 0:
             frac = self._fixed / float(self._seen)
             print(f"[min-snr] epoch {state.epoch}: fixed {self._fixed}/{self._seen} items "
-                  f"({frac*100:.1f}%) with SNR>{self.min_snr_db} dB")
+                  f"({frac * 100:.1f}%) with SNR>{self.min_snr_db} dB")
             try:
                 trainer.state.info["min_snr_fixed_frac"] = frac
             except Exception:
                 pass
-
