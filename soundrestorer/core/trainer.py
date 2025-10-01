@@ -128,7 +128,7 @@ class Trainer:
 
         # AMP
         self.autocast = autocast_from_amp(self.amp)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=need_grad_scaler(self.amp))
+        self.scaler = torch.amp.GradScaler("cuda", enabled=need_grad_scaler(self.amp))
 
         # Train state
         self.state = TrainState(epoch=0, global_step=0)

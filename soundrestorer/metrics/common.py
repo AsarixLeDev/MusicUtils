@@ -166,11 +166,12 @@ def snr_db(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 #   Spectral metrics (LSD/MRSTFT)
 # -----------------------------
 def _stft_mag(x: torch.Tensor, n_fft: int, hop: int, win: int, center: bool = True):
-    x = to_mono(x).to(torch.float32)
-    win_t = torch.hann_window(win, device=x.device, dtype=x.dtype)
-    S = torch.stft(x, n_fft=n_fft, hop_length=hop, win_length=win_t.numel(), window=win_t,
-                   center=center, return_complex=True)
-    return torch.abs(S)  # [B, F, T]
+    x = to_mono(x)         # make sure THIS returns [B,T], not [B,1,T]
+    if x.dim() == 3 and x.size(1) == 1:
+        x = x[:, 0]        # squeeze to [B,T]
+    win_t = torch.hann_window(win, device=x.device, dtype=torch.float32)
+    return torch.stft(x, n_fft=n_fft, hop_length=hop, win_length=win_t.numel(),
+                      window=win_t, center=center, return_complex=True).abs()
 
 @torch.no_grad()
 def lsd_db(yhat: torch.Tensor, clean: torch.Tensor,

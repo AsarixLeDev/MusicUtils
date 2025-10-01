@@ -22,7 +22,7 @@ from soundrestorer.callbacks import AudioDebugCallback, DataAuditCallback
 # factories (assumed present from prior steps)
 from soundrestorer.models.factory import create_model
 from soundrestorer.tasks.factory import create_task
-from soundrestorer.losses.composed import build_loss, build_from_config
+from soundrestorer.losses.composed import build_losses
 from soundrestorer.data.builder import build_loaders  # returns (train_loader, val_loader, info)
 
 # ADD (safe import; ignore if missing)
@@ -137,7 +137,7 @@ def main():
     # -----------------------
     # Losses
     # -----------------------
-    loss_fn = build_from_config(cfg["losses"])
+    loss_fn = build_losses(cfg)
 
     # -----------------------
     # Optimizer + Scheduler

@@ -119,8 +119,7 @@ class AudioDebugCallback:
             met = triad_metrics(y_i, c_i, n_i)
             snr = met.get("snr_noisy_clean_db", None)
             if snr is not None:
-                print(f"[audio-debug] saved ep{self._epoch:03d} {base} "
-                      f"with SNR(noisy,clean)={snr:+.2f} dB")
+                print(f"[audio-debug] saved ep{self._epoch:03d} {base} with SNR(noisy,clean)={float(snr):+.2f} dB")
             else:
                 print(f"[audio-debug] saved ep{self._epoch:03d} {base}")
 

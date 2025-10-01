@@ -7,7 +7,7 @@ data:
   val_manifest:   manifests/music_stems_val.jsonl
   sr: 48000
   crop: 3.0
-  mono: true
+  mono: false
 
   batch: 1
   workers: 0

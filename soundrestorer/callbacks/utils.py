@@ -89,6 +89,15 @@ def save_wav_triads(
 
     return paths
 
+# soundrestorer/callbacks/utils.py
+
+def _as_float(x):
+    import torch
+    if isinstance(x, torch.Tensor):
+        # mean() in case a batch sneaks through; detach+cpu for safety
+        return float(x.detach().mean().cpu().item())
+    return float(x)
+
 def triad_metrics(
     yhat: torch.Tensor,
     clean: Optional[torch.Tensor],
@@ -96,15 +105,19 @@ def triad_metrics(
 ) -> Dict[str, float]:
     """
     Compute a minimal set of quick metrics from waveforms (channel-first).
+    Always returns plain Python floats, never tensors.
     """
-    out = {}
+    out: Dict[str, float] = {}
     if clean is not None:
-        out["si_yhat_clean_db"] = si_sdr_db(yhat, clean)
+        out["si_yhat_clean_db"] = _as_float(si_sdr_db(yhat, clean))
     if noisy is not None and clean is not None:
-        out["si_noisy_clean_db"] = si_sdr_db(noisy, clean)
-        out["delta_si_db"] = out["si_yhat_clean_db"] - out["si_noisy_clean_db"]
-        out["snr_noisy_clean_db"] = snr_db(noisy, clean)
+        si_n = _as_float(si_sdr_db(noisy, clean))
+        si_y = out.get("si_yhat_clean_db", _as_float(si_sdr_db(yhat, clean)))
+        out["si_noisy_clean_db"] = si_n
+        out["delta_si_db"] = float(si_y - si_n)
+        out["snr_noisy_clean_db"] = _as_float(snr_db(noisy, clean))
     return out
+
 
 def infer_sr(trainer) -> Optional[int]:
     # Best effort — your Trainer already knows data SR in several places

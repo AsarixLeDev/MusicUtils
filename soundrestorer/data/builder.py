@@ -32,26 +32,13 @@ def _pick_dataset(kind: str):
     return DenoiseDataset
 
 def _inst(cls, manifest: Path, split: str, dcfg: Dict[str, Any]):
-    kwargs = dict(
-        sr=dcfg.get("sr", 48000),
-        crop=dcfg.get("crop", 3.0),
-        mono=dcfg.get("mono", True),
-        snr_min=dcfg.get("snr_min", 0.0),
-        snr_max=dcfg.get("snr_max", 20.0),
-        use_ext_noise_p=dcfg.get("use_ext_noise_p", 0.0),
-        p_clean=dcfg.get("p_clean", 0.0),
-        out_peak=dcfg.get("out_peak", 0.98),
-        split=split,
-        noise_manifest=dcfg.get("noise_manifest"),
-        noise_manifests=dcfg.get("noise_manifests", []),
-    )
     try:
-        return cls(str(manifest), **kwargs)  # many datasets accept (manifest_path, **cfg)
+        return cls(str(manifest), dcfg)  # many datasets accept (manifest_path, **cfg)
     except TypeError:
         # try common kw names for the path
         for key in ("manifest", "manifest_path", "jsonl", "path"):
             try:
-                return cls(**{key: str(manifest)}, **kwargs)
+                return cls(**{key: str(manifest)}, **dcfg)
             except TypeError:
                 continue
         raise

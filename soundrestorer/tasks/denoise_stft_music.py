@@ -15,6 +15,8 @@ from typing import Dict, Any, Tuple
 import math, torch, torch.nn as nn
 import torchaudio
 
+import torch.nn as nn  # add near top if not present
+
 # ---------------- cfg ----------------
 
 @dataclass
@@ -55,14 +57,36 @@ def _stft(y: torch.Tensor, cfg: DenoiseSTFTCfg) -> torch.Tensor:
         window=win, return_complex=True, center=cfg.center, pad_mode="reflect"
     )
 
+
+def _first_conv_in_channels(model: nn.Module) -> int:
+    """Return in_channels of the first Conv2d found; default to 1 if none found."""
+    for m in model.modules():
+        if isinstance(m, nn.Conv2d):
+            return int(m.in_channels)
+    return 1
+
 def _istft(spec: torch.Tensor, cfg: DenoiseSTFTCfg, length: int) -> torch.Tensor:
+    """
+    spec: (B,F,T) complex (preferred) or (B,1,F,T) complex
+    returns: (B,T) float32
+    """
+    if spec.dim() == 4 and spec.size(1) == 1:
+        spec = spec[:, 0]  # -> (B,F,T)
+    elif spec.dim() != 3:
+        raise RuntimeError(f"ISTFT expects (B,F,T) or (B,1,F,T), got {tuple(spec.shape)}")
+
     win = _get_window(cfg.window, cfg.n_fft, spec.device, torch.float32)
     y = torch.istft(
-        spec.to(torch.complex64), n_fft=cfg.n_fft,
-        hop_length=cfg.hop_length, win_length=cfg.win_length,
-        window=win, center=cfg.center, length=length
+        spec.to(torch.complex64),
+        n_fft=cfg.n_fft,
+        hop_length=cfg.hop_length,
+        win_length=cfg.win_length,
+        window=win,
+        center=cfg.center,
+        length=length,
+        return_complex=False,
     )
-    return y
+    return y  # (B,T)
 
 def _apply_mag_mask(spec: torch.Tensor, mask: torch.Tensor, cfg: DenoiseSTFTCfg) -> torch.Tensor:
     mag = spec.abs()
@@ -76,56 +100,50 @@ def _safe_mask(mask: torch.Tensor, cfg: DenoiseSTFTCfg) -> torch.Tensor:
     # Always enforce [floor, limit] for magnitude-like masks
     return mask.clamp(min=cfg.mask_floor, max=cfg.mask_limit)
 
-def _variant_from_head(head_out: torch.Tensor, variant: str, cfg: DenoiseSTFTCfg) -> Tuple[torch.Tensor, Dict[str, float]]:
+def _variant_from_head(head_out: torch.Tensor, variant: str, cfg: DenoiseSTFTCfg):
     """
-    Convert raw head_out (B, C, F, T) to complex or magnitude mask,
-    returning (complex_mask or mag_mask, stats).
+    Convert raw head_out (B, C, F, T) to a mask of shape (B, F, T):
+      - magnitude mask: real tensor in [mask_floor, mask_limit]
+      - complex mask:   complex64 tensor with amplitude clamped to [floor, limit]
     """
     stats = {}
     v = (variant or "mag_sigmoid").lower()
-    B, C, F, TT = head_out.shape
+    B, C, F, T = head_out.shape
 
     if v in ("mag_sigmoid", "mag", "mag_delta1", "delta1"):
-        # Produce a magnitude mask in [mask_floor, mask_limit]
         if v == "mag_sigmoid":
-            m = torch.sigmoid(head_out[:, 0:1])
+            m = torch.sigmoid(head_out[:, 0:1])  # (B,1,F,T)
             mask = cfg.mask_floor + (cfg.mask_limit - cfg.mask_floor) * m
         elif v == "mag_delta1":
-            # 1 + residual, then bound
             mask = 1.0 + head_out[:, 0:1]
-            mask = _safe_mask(mask, cfg)
+            mask = mask.clamp(min=cfg.mask_floor, max=cfg.mask_limit)
         elif v == "delta1":
-            # legacy delta around 1.0 but still magnitude-only
             mask = 1.0 + torch.tanh(head_out[:, 0:1])
-            mask = _safe_mask(mask, cfg)
-        else:
-            # "mag": unbounded -> squash via sigmoid to stay stable
+            mask = mask.clamp(min=cfg.mask_floor, max=cfg.mask_limit)
+        else:  # "mag"
             m = torch.sigmoid(head_out[:, 0:1])
             mask = cfg.mask_floor + (cfg.mask_limit - cfg.mask_floor) * m
+
+        # SQUEEZE channel -> (B,F,T)
+        mask = mask[:, 0]
         stats["mask_min"] = float(mask.min().item())
         stats["mask_max"] = float(mask.max().item())
         return mask, stats
 
-    # complex mask (M_re, M_im) with optional amplitude clamp
+    # complex variants -> (B,F,T) complex
     if C < 2:
-        # upgrade to 2 channels by duplication if needed
+        # duplicate real into imaginary if missing
         z = torch.zeros_like(head_out[:, 0:1])
         head_out = torch.cat([head_out[:, 0:1], z], dim=1)
 
-    M_re = head_out[:, 0]
-    M_im = head_out[:, 1]
-
-    if v == "complex_delta1":
-        M_re = 1.0 + M_re  # residual around 1+0j
-
-    M = torch.complex(M_re, M_im)
-    # soft clamp amplitude
+    Mr = head_out[:, 0]
+    Mi = head_out[:, 1]
+    M = torch.complex(Mr, Mi)
+    # amplitude clamp -> [floor, limit]
     amp = torch.abs(M)
-    amp_clamped = amp.clamp(min=cfg.mask_floor, max=cfg.mask_limit)
-    M = M * (amp_clamped / (amp + cfg.eps))
-
-    stats["mask_amp_min"] = float(amp_clamped.min().item())
-    stats["mask_amp_max"] = float(amp_clamped.max().item())
+    M = M * (amp.clamp(min=cfg.mask_floor, max=cfg.mask_limit) / (amp + cfg.eps))
+    stats["mask_amp_min"] = float(amp.min().item())
+    stats["mask_amp_max"] = float(amp.max().item())
     return M, stats
 
 # ------------- main task -------------
@@ -133,7 +151,6 @@ def _variant_from_head(head_out: torch.Tensor, variant: str, cfg: DenoiseSTFTCfg
 class DenoiseSTFTMusic(nn.Module):
     def __init__(self, model: nn.Module, args: Dict[str, Any]):
         super().__init__()
-        # model: any 2D UNet-like that maps (B, C_in=1, F, T) -> (B, C_out, F, T)
         self.model = model
         self.cfg = DenoiseSTFTCfg(
             n_fft           = int(args.get("n_fft", 1024)),
@@ -148,49 +165,50 @@ class DenoiseSTFTMusic(nn.Module):
             safe_unity_fallback = bool(args.get("safe_unity_fallback", True)),
             return_debug   = bool(args.get("return_debug", False)),
         )
+        # NEW: detect what the model expects at its first conv
+        self._in_ch = _first_conv_in_channels(self.model)
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        batch["noisy"]: (B, T) or (B, 1, T)
-        Return dict with "yhat": (B, T)
-        """
         noisy = batch["noisy"]
-        if noisy.dim() == 2:
-            B, T = noisy.shape
-            y = noisy
-        elif noisy.dim() == 3 and noisy.size(1) == 1:
-            B, _, T = noisy.shape
-            y = noisy[:, 0]
-        else:
-            raise ValueError("Expected noisy as (B, T) or (B, 1, T)")
+        if noisy.dim() == 3 and noisy.size(1) == 1:
+            noisy = noisy[:, 0]  # (B,T)
+        elif noisy.dim() != 2:
+            raise ValueError("Expected noisy as (B,T) or (B,1,T)")
 
-        S = _stft(y, self.cfg)          # (B, F, TT) complex
+        B, T = noisy.shape
+
+        # STFT
+        S = _stft(noisy, self.cfg)  # (B,F,T) complex
         mag = torch.abs(S)
-        # Log1p magnitude input (stable across levels)
-        x_in = torch.log1p(mag).unsqueeze(1)  # (B,1,F,TT)
 
-        head = self.model(x_in)                 # (B, C_out, F, TT)
-        mask_pred, mstats = _variant_from_head(head, self.cfg.mask_variant, self.cfg)
-
-        if torch.is_complex(mask_pred):
-            Shat = S * mask_pred
+        # NEW: choose representation to match the model's expected input channels
+        if self._in_ch >= 2:
+            # Feed RI (2 channels)
+            x_in = torch.stack([S.real, S.imag], dim=1)  # (B,2,F,T)
         else:
-            # magnitude mask; keep noisy phase
+            # Feed log-magnitude (1 channel)
+            x_in = torch.log1p(mag).unsqueeze(1)  # (B,1,F,T)
+
+        head = self.model(x_in)  # (B,C_out,F,T)
+
+        # Mask mapping stays the same as before:
+        M, mstats = _variant_from_head(head, self.cfg.mask_variant, self.cfg)
+
+        if torch.is_complex(M):
+            Shat = S * M  # (B,F,T) complex
+        else:
             pha = torch.angle(S)
-            mag_hat = mag * mask_pred
+            mag_hat = mag * M  # (B,F,T)
             Shat = torch.polar(mag_hat, pha)
 
-        yhat = _istft(Shat, self.cfg, length=T)  # (B, T)
+        yhat = _istft(Shat, self.cfg, length=T)  # (B,T)
 
         if self.cfg.safe_unity_fallback:
-            # If something went NaN/Inf, fallback to identity
-            bad = torch.isnan(yhat) | torch.isinf(yhat)
-            if bad.any():
-                yhat = y.clone()
+            if not torch.isfinite(yhat).all():
+                yhat = noisy.clone()
 
         out = {"yhat": yhat}
         if self.cfg.return_debug:
-            out["debug"] = {
-                "mask_stats": mstats,
-            }
+            out["debug"] = {"mask_stats": mstats}
         return out
+
