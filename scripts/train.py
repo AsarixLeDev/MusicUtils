@@ -25,12 +25,6 @@ from soundrestorer.tasks.factory import create_task
 from soundrestorer.losses.composed import build_losses
 from soundrestorer.data.builder import build_loaders  # returns (train_loader, val_loader, info)
 
-# ADD (safe import; ignore if missing)
-try:
-    from soundrestorer.callbacks.proc_noise_augment import ProcNoiseAugmentCallback
-except Exception:
-    ProcNoiseAugmentCallback = None
-
 # -----------------------
 # Helpers
 # -----------------------
@@ -150,30 +144,16 @@ def main():
     # Callbacks
     # -----------------------
     cbs = []
-    # wire defaults if enabled
+
+    # 0) Procedural noise first — mutates 'noisy' before anyone audits/saves it
+    try:
+        from soundrestorer.callbacks.proc_noise_augment import ProcNoiseAugmentCallback
+        from soundrestorer.callbacks.ensure_min_snr import EnsureMinSNRCallback
+    except Exception:
+        ProcNoiseAugmentCallback = None
+        EnsureMinSNRCallback = None
+
     cb_cfg = cfg.get("callbacks", {})
-    if cb_cfg.get("audio_debug", {}).get("enable", True):
-        p = cb_cfg.get("audio_debug", {})
-        cbs.append(AudioDebugCallback(
-            per_epoch=int(p.get("per_epoch", 3)),
-            scan_batches=int(p.get("scan_batches", 32)),
-            seed=int(p.get("seed", 1234)),
-            prefer_clean_resid=bool(p.get("prefer_clean_resid", True)),
-            subdir=str(p.get("subdir", "logs/audio_debug")),
-            sr=data_sr,
-            print_metrics=True,
-        ))
-    if cb_cfg.get("data_audit", {}).get("enable", True):
-        p = cb_cfg.get("data_audit", {})
-        cbs.append(DataAuditCallback(
-            max_items=int(p.get("max_items", 12)),
-            take_from_batches=int(p.get("take_from_batches", 6)),
-            subdir=str(p.get("subdir", "logs/data_audit")),
-            sr=data_sr,
-            silence_threshold=float(p.get("silence_threshold", 0.95)),
-            write_wavs=bool(p.get("write_wavs", True)),
-            write_csv=bool(p.get("write_csv", True)),
-        ))
 
     if ProcNoiseAugmentCallback is not None and cb_cfg.get("proc_noise", {}).get("enable", False):
         pn = cb_cfg["proc_noise"]
@@ -187,6 +167,46 @@ def main():
             noise_cfg=pn.get("noise_cfg", {})
         ))
         print("[callbacks] ProcNoiseAugmentCallback enabled")
+
+    # (optional) rescue items that are still too clean after dataset/proc:
+    if EnsureMinSNRCallback is not None and cb_cfg.get("ensure_min_snr", {}).get("enable", False):
+        em = cb_cfg["ensure_min_snr"]
+        cbs.append(EnsureMinSNRCallback(
+            sr=int(cfg["data"]["sr"]),
+            min_snr_db=float(em.get("min_snr_db", 25.0)),
+            snr_min=float(em.get("snr_min", 4.0)),
+            snr_max=float(em.get("snr_max", 20.0)),
+            out_peak=float(cfg["data"].get("out_peak", 0.98)),
+            train_only=True,
+        ))
+
+    # 1) Data audit (now sees post-augment 'noisy')
+    from soundrestorer.callbacks import DataAuditCallback, AudioDebugCallback
+    if cb_cfg.get("data_audit", {}).get("enable", True):
+        p = cb_cfg.get("data_audit", {})
+        cbs.append(DataAuditCallback(
+            max_items=int(p.get("max_items", 12)),
+            take_from_batches=int(p.get("take_from_batches", 6)),
+            subdir=str(p.get("subdir", "logs/data_audit")),
+            sr=int(cfg["data"]["sr"]),
+            silence_threshold=float(p.get("silence_threshold", 0.95)),
+            write_wavs=bool(p.get("write_wavs", True)),
+            write_csv=bool(p.get("write_csv", True)),
+        ))
+
+    # 2) Audio debug (validation-time triads)
+    if cb_cfg.get("audio_debug", {}).get("enable", True):
+        p = cb_cfg.get("audio_debug", {})
+        cbs.append(AudioDebugCallback(
+            per_epoch=int(p.get("per_epoch", 3)),
+            scan_batches=int(p.get("scan_batches", 32)),
+            seed=int(p.get("seed", 1234)),
+            prefer_clean_resid=bool(p.get("prefer_clean_resid", True)),
+            subdir=str(p.get("subdir", "logs/audio_debug")),
+            sr=int(cfg["data"]["sr"]),
+            print_metrics=True,
+        ))
+
 
     # -----------------------
     # Trainer
