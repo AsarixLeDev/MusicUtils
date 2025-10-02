@@ -21,11 +21,10 @@ data:
   pin_memory: true
   persistent_workers: false
 
-  snr_min: 3.0
-  snr_max: 6.0
-  use_ext_noise_p: 1.0
+  snr_min: 8.0
+  snr_max: 8.0
+  use_ext_noise_p: 0.0
   p_clean: 0.0
-  out_peak: 0.98
 
   target: mixture
   allowed_stems: [vocals, drums, bass, other]
@@ -38,11 +37,11 @@ model:
 task:
   name: denoise_stft
   args:
-    mask_variant: mag_sigmoid
+    mask_variant: complex
     mask_floor: 0.30
-    mask_limit: 1.80
+    mask_limit: 2.0
     clamp_mask_tanh: 0.0
-    safe_unity_fallback: true
+    safe_unity_fallback: false
 
 losses:
   items:
@@ -60,16 +59,40 @@ optim:
   lr_min_factor: 1.0
 
 train:
-  epochs: 1
+  epochs: 5
   save_every: 1
   ema: 0.0
 
-callbacks: {}
+callbacks:
+  # 100% replacement to guarantee we actually train on noisy inputs
+  proc_noise:
+    name: ProcNoiseAugmentCallback
+    args:
+      sr: 48000
+      prob: 1.0          # <--- FORCE
+      snr_min: 8.0
+      snr_max: 8.0
+      fixed_per_epoch: true   # or fixed_seed: 1234
+      fixed_seed: 1234
+      out_peak: 0.98
+      train_only: true
+      track_stats: true
+
+  # Keep this AFTER proc_noise so we audit post-augment 'noisy'
+  data_audit:
+    name: DataAuditCallback
+    args:
+      sr: 48000
+      first_epochs: 1
+      max_batches: 6
+      max_items: 12
+      normalize_peak_dbfs: -1.0
+      emph_snr_db: 12.0   # optional "re-level" noisy for quick listening
 
 hard_mining: { enable: false }
 
 debug:
-  overfit_steps: 600
+  overfit_steps: 2000
   val_every: 1
   val_max_batches: 2
   sisdr_ignore_if_noisy_gt_db: 25.0

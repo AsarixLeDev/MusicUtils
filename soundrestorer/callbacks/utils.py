@@ -22,6 +22,30 @@ class Triad:
     sr: int
 
 
+def _to_mono_ct(x: torch.Tensor) -> torch.Tensor:
+    # x: (C,T) or (T,)
+    if x.dim() == 1:
+        return x.unsqueeze(0)
+    if x.dim() == 2 and x.size(0) > 1:
+        return x.mean(dim=0, keepdim=True)
+    return x
+
+def _resid_noise_ls(noisy_ct: torch.Tensor, clean_ct: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """
+    Least-squares residual of noisy vs clean.
+    Returns mono (1,T) residual ~ noise with clean removed (scale-invariant).
+    """
+    n_ct, c_ct = match_len(_to_mono_ct(noisy_ct), _to_mono_ct(clean_ct))  # (1,T)
+    # remove DC (helps perceived 'musiciness')
+    n_ct = n_ct - n_ct.mean(dim=-1, keepdim=True)
+    c_ct = c_ct - c_ct.mean(dim=-1, keepdim=True)
+    # α = <n,c> / ||c||^2
+    num = (n_ct * c_ct).sum(dim=-1, keepdim=True)
+    den = (c_ct.pow(2).sum(dim=-1, keepdim=True))
+    alpha = num / (den + eps)
+    resid = n_ct - alpha * c_ct  # (1,T)
+    return resid
+
 def _prep_audio(x: torch.Tensor) -> torch.Tensor:
     """
     Ensure float32 on CPU, clamp to [-1,1], channel-first [C,T].
@@ -50,53 +74,60 @@ def save_wav(path: Path, wav: torch.Tensor, sr: int) -> None:
     torchaudio.save(str(path), wav, sr)
 
 
+
+def _resid_error(clean_ct: torch.Tensor, yhat_ct: torch.Tensor) -> torch.Tensor:
+    """
+    Model error residual = clean - yhat, mono.
+    """
+    c_ct, y_ct = match_len(_to_mono_ct(clean_ct), _to_mono_ct(yhat_ct))
+    return c_ct - y_ct
+
 def save_wav_triads(
-        out_dir: Path,
-        base: str,
-        triad: Triad,
-        *,
-        want_resid: bool = True,
-        prefer_clean_resid: bool = True,
+    out_dir: Path,
+    base: str,
+    triad: Triad,
+    *,
+    want_resid: bool = True,
+    resid_mode: str = "noise",    # "noise" (noisy - alpha*clean) or "error" (clean - yhat)
 ) -> Dict[str, Path]:
     """
-    Save _clean/_noisy/_yhat (+ optional _resid) with robust dtype handling.
-    Returns dict of saved paths.
+    Save _clean/_noisy/_yhat (+ _resid) as float32 WAVs.
+    Residual:
+      - "noise": least-squares projection residual (noisy − α·clean), mono -> true injected noise
+      - "error": model error (clean − yhat), mono
     """
     paths: Dict[str, Path] = {}
-    c = _prep_audio(triad.clean) if triad.clean is not None else None
-    n = _prep_audio(triad.noisy) if triad.noisy is not None else None
-    y = _prep_audio(triad.yhat) if triad.yhat is not None else None
-    sr = triad.sr
+    c = _prep_audio(triad.clean) if triad.clean is not None else None    # (C,T)
+    n = _prep_audio(triad.noisy) if triad.noisy is not None else None    # (C,T)
+    y = _prep_audio(triad.yhat)  if triad.yhat  is not None else None    # (C,T)
+    sr = int(triad.sr)
 
     if c is not None:
         p = out_dir / f"{base}_clean.wav"
-        save_wav(p, c, sr);
-        paths["clean"] = p
+        save_wav(p, c, sr); paths["clean"] = p
     if n is not None:
         p = out_dir / f"{base}_noisy.wav"
-        save_wav(p, n, sr);
-        paths["noisy"] = p
+        save_wav(p, n, sr); paths["noisy"] = p
     if y is not None:
         p = out_dir / f"{base}_yhat.wav"
-        save_wav(p, y, sr);
-        paths["yhat"] = p
+        save_wav(p, y, sr); paths["yhat"] = p
 
-    if want_resid and y is not None:
-        resid = None
-        if prefer_clean_resid and c is not None:
-            a, b = match_len(c, y)  # [C,T]
-            resid = a - b
-        elif n is not None:
-            a, b = match_len(n, y)
-            resid = a - b
+    if want_resid:
+        resid: Optional[torch.Tensor] = None
+        try:
+            if resid_mode == "noise" and (n is not None and c is not None):
+                resid = _resid_noise_ls(n, c)          # (1,T)
+            elif resid_mode == "error" and (c is not None and y is not None):
+                resid = _resid_error(c, y)             # (1,T)
+        except Exception:
+            resid = None
+
         if resid is not None:
             resid = torch.clamp(resid, -1.0, 1.0)
             p = out_dir / f"{base}_resid.wav"
-            save_wav(p, resid, sr);
-            paths["resid"] = p
+            save_wav(p, resid, sr); paths["resid"] = p
 
     return paths
-
 
 # soundrestorer/callbacks/utils.py
 

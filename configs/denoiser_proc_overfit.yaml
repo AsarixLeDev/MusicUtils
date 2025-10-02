@@ -3,22 +3,23 @@ paths:
   run_name: denoiser_proc_overfit
 
 data:
-  train_manifest: manifests/music_stems_train.jsonl   # your stems/mixture manifest
+  train_manifest: manifests/music_stems_train.jsonl
   val_manifest:   manifests/music_stems_val.jsonl
   sr: 48000
   crop: 3.0
-  mono: false
-
+  mono: true     # ✔ works, but note the task currently mixes channels to mono for STFT.
+                 #    If you want *true stereo denoising*, we’d need to keep channels and map masks per channel.
+                 #    For overfit sanity, consider mono:true for speed/consistency.
+  fixed_index: 0        # always train on item 0
   batch: 1
   workers: 0
   prefetch_factor: 2
   pin_memory: true
   persistent_workers: false
 
-  # IMPORTANT: no external noise
   noise_manifests: []
   use_ext_noise_p: 0.0
-  p_clean: 0.0         # don't pass clean through in this test
+  p_clean: 0.0
   out_peak: 0.98
 
 model:
@@ -26,7 +27,7 @@ model:
   args:
     base: 48
     depth: 5
-    out_ch: 1
+    out_ch: 1            # ✔ output 1-channel mask; task averages to mono anyway
 
 task:
   name: denoise_stft_music
@@ -39,14 +40,11 @@ task:
     mask_limit: 1.80
     clamp_mask_tanh: 0.0
     safe_unity_fallback: true
-    return_debug: false
+    return_debug: false  # ✔
 
 losses:
   items:
-    - { name: mrstft,  weight: 0.02,
-        args: { fft_sizes: [1024, 2048], hops: [256, 512], win_lengths: [1024, 2048] } }
-    - { name: l1_wave, weight: 1.00 }
-    - { name: sisdr_pos, weight: 1.50 }
+    - { name: l1_wave, weight: 1.00 }    # ✔ simple overfit sanity; MR-STFT can be added later
 
 optim:
   lr: 1.0e-3
@@ -57,50 +55,51 @@ optim:
   lr_min_factor: 1.0
 
 train:
-  epochs: 1
+  epochs: 5
   save_every: 1
   ema: 0.0
 
 callbacks:
-  # turn procedural noise on here
   proc_noise:
     enable: true
-    prob: 1.0          # apply to every batch in this micro-test
-    snr_min: -2.0
-    snr_max: 12.0
-    noise_cfg:
-      # these keys are supported by your existing NoiseFactory
-      mix:
-        white: 0.5
-        pink: 0.5
-      hum:
-        enable: true
-        freq_hz: [50, 60]
-        harmonics: 3
-        jitter_hz: 0.5
-      hiss:
-        enable: true
-        band_hz: [8000, 16000]
+    prob: 1.0
+    snr_min: 8.0
+    snr_max: 8.0
+    fixed_seed: 1234
+    fixed_per_epoch: true
+    require_replace: true   # ✔ fail-fast if a batch is still clean
+    train_only: true        # NOTE: validation (audio_debug) will be clean. For noisy debug, set false temporarily.
+
   audio_debug:
     enable: true
     per_epoch: 3
     scan_batches: 16
+
   data_audit:
     enable: true
     max_items: 12
     take_from_batches: 6
 
+  save_preds:
+    enable: true
+    args:
+      every_steps: 50
+      per_batch: 1
+      max_total: 50
+      save_triads: true
+      out_subdir: logs/pred_dumps
+
 hard_mining: { enable: false }
 
 debug:
-  overfit_steps: 300
+  overfit_steps: 2000
   val_every: 1
   val_max_batches: 2
   pbar_every: 8
   print_comp: true
 
 runtime:
-  amp: float32
+  amp: float32           # ✔ for sanity; later you can use bfloat16 for speed if your GPU supports it
   channels_last: true
   cuda_graph: false
   compile: false

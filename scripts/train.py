@@ -153,6 +153,11 @@ def main():
         ProcNoiseAugmentCallback = None
         EnsureMinSNRCallback = None
 
+    try:
+        from soundrestorer.callbacks.save_preds import SavePredsEveryNStepsCallback
+    except Exception:
+        SavePredsEveryNStepsCallback = None
+
     cb_cfg = cfg.get("callbacks", {})
 
     if ProcNoiseAugmentCallback is not None and cb_cfg.get("proc_noise", {}).get("enable", False):
@@ -206,6 +211,19 @@ def main():
             sr=int(cfg["data"]["sr"]),
             print_metrics=True,
         ))
+
+    sp = cb_cfg.get("save_preds", {})
+    if SavePredsEveryNStepsCallback and sp.get("enable", False):
+        args = sp.get("args", {})
+        cbs.append(SavePredsEveryNStepsCallback(
+            out_subdir=str(args.get("out_subdir", "logs/pred_dumps")),
+            every_steps=int(args.get("every_steps", 100)),
+            per_batch=int(args.get("per_batch", 1)),
+            max_total=int(args.get("max_total", 200)),
+            save_triads=bool(args.get("save_triads", False)),
+            resid_mode=str(args.get("resid_mode", "noise")),
+        ))
+        print("[callbacks] SavePredsEveryNStepsCallback enabled")
 
 
     # -----------------------

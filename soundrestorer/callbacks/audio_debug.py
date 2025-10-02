@@ -102,6 +102,7 @@ class AudioDebugCallback(Callback):
         clean = batch.get("clean", None)
         noisy = batch.get("noisy", None)
         if yhat is None or clean is None:
+            print("[WARNING] yhat or clean missing")
             return
 
         B = yhat.shape[0] if yhat.dim() == 3 else 1
@@ -137,7 +138,7 @@ class AudioDebugCallback(Callback):
         paths = save_wav_triads(
             self._outdir, base,
             Triad(clean=c_i, noisy=n_i, yhat=y_i, sr=sr),
-            want_resid=True, prefer_clean_resid=self.prefer_clean_resid
+            want_resid=True
         )
 
         self._saved += 1

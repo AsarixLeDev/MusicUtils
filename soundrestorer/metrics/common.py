@@ -18,7 +18,7 @@ from typing import Optional, Tuple, List
 import torch
 import torchaudio
 
-from ..utils.audio import to_mono
+from ..utils.audio import to_mono, get_stft_window
 from ..utils.metrics import si_sdr_db
 
 _EPS = EPS = 1e-10
@@ -27,6 +27,38 @@ _EPS = EPS = 1e-10
 # -----------------------------
 # Basic tensor utilities
 # -----------------------------
+
+def _as_bt(x: torch.Tensor) -> torch.Tensor:
+    if x.dim() == 1:   # (T,)
+        return x.unsqueeze(0)
+    if x.dim() == 2:   # (B,T) or (C,T) — assume (B,T)
+        return x
+    if x.dim() == 3:   # (B,C,T) -> (B,T) mono
+        if x.size(1) == 1:
+            return x[:, 0, :]
+        return x.mean(dim=1)
+    raise RuntimeError(f"Unexpected shape {tuple(x.shape)}")
+
+
+def _stft_mag(x: torch.Tensor, n_fft: int, hop: int,
+              win: torch.Tensor | None = None, center: bool = True,
+              win_length: int | None = None) -> torch.Tensor:
+    """
+    Backward-compatible signature (accepts 'win' if provided),
+    but always creates the window via get_stft_window with correct device/dtype.
+    Returns |STFT| with shape (B,F,T).
+    """
+    x_bt = _as_bt(x)
+    if win is not None:
+        win_length = int(win.numel())
+        window = win.to(device=x_bt.device, dtype=x_bt.dtype)
+    else:
+        win_length = n_fft if win_length is None else int(win_length)
+        window = get_stft_window("hann", win_length, device=x_bt.device, dtype=x_bt.dtype, periodic=True)
+
+    S = torch.stft(x_bt, n_fft=n_fft, hop_length=hop, win_length=win_length, window=window,
+                   center=center, normalized=False, return_complex=True)
+    return torch.abs(S)
 
 
 def match_len(a: torch.Tensor, b: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -168,13 +200,48 @@ def snr_db(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 # -----------------------------
 #   Spectral metrics (LSD/MRSTFT)
 # -----------------------------
-def _stft_mag(x: torch.Tensor, n_fft: int, hop: int, win: int, center: bool = True):
-    x = to_mono(x)  # make sure THIS returns [B,T], not [B,1,T]
-    if x.dim() == 3 and x.size(1) == 1:
-        x = x[:, 0]  # squeeze to [B,T]
-    win_t = torch.hann_window(win, device=x.device, dtype=torch.float32)
-    return torch.stft(x, n_fft=n_fft, hop_length=hop, win_length=win_t.numel(),
-                      window=win_t, center=center, return_complex=True).abs()
+def _as_bt(x: torch.Tensor) -> torch.Tensor:
+    """
+    Force audio to (B,T):
+      (T,) -> (1,T)
+      (B,T) -> (B,T)
+      (B,1,T) -> (B,T)
+      (B,C,T) -> (B,T) mean over C
+      (C,T)   -> (1,T) mean over C
+    """
+    if x.dim() == 1:
+        return x.unsqueeze(0)
+    if x.dim() == 2:
+        # ambiguous (B,T) vs (C,T); treat as (B,T)
+        return x
+    if x.dim() == 3:
+        if x.size(1) == 1:
+            return x[:, 0, :]
+        return x.mean(dim=1)
+    raise RuntimeError(f"Unexpected audio shape {tuple(x.shape)}")
+
+def _stft_mag(x: torch.Tensor,
+              n_fft: int,
+              hop: int,
+              win: Optional[int] = None,
+              center: bool = True,
+              window_kind: str = "hann",
+              normalized: bool = False,
+              onesided: bool = True) -> torch.Tensor:
+    """
+    Magnitude STFT with a shared, cached window. Accepts win=None (defaults to n_fft).
+    Returns |STFT| with shape (B,F,T).
+    """
+    x_bt = _as_bt(x)
+    win_length = n_fft if win is None else int(win)
+    # window dtype should match real dtype of x_bt (even if you later use autocast)
+    win_t = get_stft_window(window_kind, win_length,
+                            device=x_bt.device, dtype=x_bt.dtype, periodic=True)
+    S = torch.stft(
+        x_bt, n_fft=n_fft, hop_length=hop, win_length=win_length, window=win_t,
+        center=center, normalized=normalized, onesided=onesided, return_complex=True
+    )
+    return torch.abs(S)
 
 
 @torch.no_grad()

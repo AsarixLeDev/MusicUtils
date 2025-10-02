@@ -4,7 +4,104 @@ from __future__ import annotations
 
 from typing import List, Sequence, Tuple, Optional
 
+# ---- STFT window + wrappers (shared) ----------------------------------------
+from typing import Optional, Tuple
 import torch
+
+# (kind, n_fft, periodic, device_str, dtype_str) -> window Tensor
+_WINDOW_CACHE: dict[Tuple[str, int, bool, str, str], torch.Tensor] = {}
+
+def get_stft_window(kind: str = "hann",
+                    n_fft: int = 1024,
+                    device: Optional[torch.device] = None,
+                    dtype: Optional[torch.dtype] = None,
+                    periodic: bool = True) -> torch.Tensor:
+    """
+    Return a cached window tensor on the requested device & dtype.
+    """
+    device = torch.device("cpu") if device is None else device
+    dtype = torch.float32 if dtype is None else dtype
+    key = (kind.lower(), int(n_fft), bool(periodic), str(device), str(dtype))
+    win = _WINDOW_CACHE.get(key, None)
+    if win is None or win.device != device or win.dtype != dtype or win.numel() != n_fft:
+        if kind.lower() == "hann":
+            win = torch.hann_window(n_fft, periodic=periodic, device=device, dtype=dtype)
+        elif kind.lower() == "hamming":
+            win = torch.hamming_window(n_fft, periodic=periodic, device=device, dtype=dtype)
+        elif kind.lower() == "ones":
+            win = torch.ones(n_fft, device=device, dtype=dtype)
+        else:
+            raise ValueError(f"Unknown window kind: {kind}")
+        _WINDOW_CACHE[key] = win
+    return win
+
+
+def _ensure_bt(x: torch.Tensor, allow_stereo_to_mono: bool = True) -> torch.Tensor:
+    """
+    Convert x into (B,T) consistently:
+      - (T,)   -> (1,T)
+      - (1,T)  -> (1,T)
+      - (B,T)  -> (B,T)
+      - (C,T)  -> (1,T) if allow_stereo_to_mono (mean over C), else error
+      - (B,1,T)-> (B,T)
+      - (B,C,T)-> (B,T) (mean over channels) if allow_stereo_to_mono, else error
+    """
+    if x.dim() == 1:
+        return x.unsqueeze(0)
+    if x.dim() == 2:
+        # Ambiguity: could be (B,T) or (C,T). We accept as (B,T).
+        return x
+    if x.dim() == 3:
+        if x.size(1) == 1:
+            return x[:, 0, :]
+        if allow_stereo_to_mono:
+            return x.mean(dim=1)
+        raise RuntimeError(f"Expected (B,1,T) but got {tuple(x.shape)}")
+    raise RuntimeError(f"Unexpected tensor shape {tuple(x.shape)}")
+
+
+def stft_mag_bt(x: torch.Tensor,
+                n_fft: int, hop: int, win_length: Optional[int] = None,
+                window_kind: str = "hann",
+                center: bool = True,
+                normalized: bool = False,
+                onesided: bool = True,
+                eps: float = 1e-12) -> torch.Tensor:
+    """
+    Magnitude STFT for audio shaped like (T,), (B,T), (B,1,T) or (B,C,T) -> (B,F,T)
+    """
+    x_bt = _ensure_bt(x)
+    win_length = n_fft if win_length is None else int(win_length)
+    win = get_stft_window(window_kind, win_length, device=x_bt.device, dtype=x_bt.dtype, periodic=True)
+    S = torch.stft(x_bt, n_fft=n_fft, hop_length=hop, win_length=win_length, window=win,
+                   center=center, normalized=normalized, onesided=onesided, return_complex=True)
+    return torch.abs(S).clamp_min(eps)
+
+
+def istft_from_cplx_bt(S_bft: torch.Tensor,
+                       n_fft: int, hop: int, win_length: Optional[int] = None,
+                       window_kind: str = "hann",
+                       center: bool = True,
+                       normalized: bool = False,
+                       length: Optional[int] = None,
+                       onesided: bool = True) -> torch.Tensor:
+    """
+    ISTFT for complex spectrogram shaped (B,F,T) -> (B,T)
+    """
+    if not torch.is_complex(S_bft):
+        raise RuntimeError("istft_from_cplx_bt expects a complex-valued spectrogram (B,F,T).")
+    win_length = n_fft if win_length is None else int(win_length)
+    # Use real dtype of complex tensor for the window
+    dtype = torch.float32 if S_bft.dtype not in (torch.complex64, torch.complex128) else (
+        torch.float32 if S_bft.dtype == torch.complex64 else torch.float64
+    )
+    win = get_stft_window(window_kind, win_length, device=S_bft.device, dtype=dtype, periodic=True)
+    y_bt = torch.istft(S_bft, n_fft=n_fft, hop_length=hop, win_length=win_length, window=win,
+                       center=center, normalized=normalized, onesided=onesided, length=length,
+                       return_complex=False)
+    # (B,T)
+    return y_bt
+
 
 
 def ensure_3d(x: torch.Tensor) -> torch.Tensor:

@@ -12,10 +12,12 @@ Compatible with your trainer: outputs["yhat"] is waveform (B, T).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
 
 import torch
 import torch.nn as nn  # add near top if not present
+
+from ..utils.audio import get_stft_window
 
 
 # ---------------- cfg ----------------
@@ -42,18 +44,9 @@ class DenoiseSTFTCfg:
 
 # ------------- helpers -------------
 
-def _get_window(name: str, n_fft: int, device, dtype):
-    name = (name or "hann").lower()
-    if name == "hann":
-        return torch.hann_window(n_fft, device=device, dtype=dtype)
-    if name == "hamming":
-        return torch.hamming_window(n_fft, device=device, dtype=dtype)
-    # default
-    return torch.hann_window(n_fft, device=device, dtype=dtype)
-
 
 def _stft(y: torch.Tensor, cfg: DenoiseSTFTCfg) -> torch.Tensor:
-    win = _get_window(cfg.window, cfg.n_fft, y.device, torch.float32)
+    win = get_stft_window(cfg.window, cfg.n_fft, y.device, torch.float32)
     return torch.stft(
         y.to(torch.float32), n_fft=cfg.n_fft,
         hop_length=cfg.hop_length, win_length=cfg.win_length,
@@ -79,7 +72,7 @@ def _istft(spec: torch.Tensor, cfg: DenoiseSTFTCfg, length: int) -> torch.Tensor
     elif spec.dim() != 3:
         raise RuntimeError(f"ISTFT expects (B,F,T) or (B,1,F,T), got {tuple(spec.shape)}")
 
-    win = _get_window(cfg.window, cfg.n_fft, spec.device, torch.float32)
+    win = get_stft_window(cfg.window, cfg.n_fft, spec.device, torch.float32)
     y = torch.istft(
         spec.to(torch.complex64),
         n_fft=cfg.n_fft,

@@ -270,13 +270,32 @@ class Trainer:
                 batch = move_to(batch, self.device)
 
             # Legacy per-batch start (needed by ProcNoiseAugmentCallback)
+            # ---------- legacy on_batch_start (PHASE 1: noise mutators) ----------
+            # run known mutators first (ProcNoiseAugmentCallback, EnsureMinSNRCallback)
             for cb in self.callbacks:
                 fn = getattr(cb, "on_batch_start", None)
-                if callable(fn):
+                if not callable(fn):
+                    continue
+                # heuristic: mutators have a 'noise' attribute or class name contains 'Noise' or 'MinSNR'
+                cname = cb.__class__.__name__.lower()
+                if hasattr(cb, "noise") or "noise" in cname or "minsnr" in cname:
                     try:
                         fn(trainer=self, state=self.state, batch=batch)
                     except Exception as e:
-                        print(f"[cb-warn] on_batch_start error: {e}")
+                        print(f"[cb-warn] on_batch_start(mutator) error: {e}")
+
+            # ---------- legacy on_batch_start (PHASE 2: the rest) ----------
+            for cb in self.callbacks:
+                fn = getattr(cb, "on_batch_start", None)
+                if not callable(fn):
+                    continue
+                cname = cb.__class__.__name__.lower()
+                if hasattr(cb, "noise") or "noise" in cname or "minsnr" in cname:
+                    continue  # already ran
+                try:
+                    fn(trainer=self, state=self.state, batch=batch)
+                except Exception as e:
+                    print(f"[cb-warn] on_batch_start error: {e}")
             # forward + loss
             with self.autocast:
                 outputs = self.task(batch)
