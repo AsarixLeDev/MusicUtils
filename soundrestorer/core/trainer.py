@@ -1,437 +1,445 @@
 # -*- coding: utf-8 -*-
-# soundrestorer/core/trainer.py
 from __future__ import annotations
 
+import math
 import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
-from torch.nn.utils import clip_grad_norm_
-from torch.optim import Optimizer
-from torch.optim.lr_scheduler import _LRScheduler
 
-from soundrestorer.utils.torch_utils import (
-    move_to, autocast_from_amp, need_grad_scaler, set_channels_last,
-    load_state_dict_loose, latest_checkpoint, format_ema,
-)
+# optional utilities if present in your project (we guard their absence)
+try:
+    from soundrestorer.utils.metrics import si_sdr_db  # robust SI-SDR (dB)
+except Exception:
+    si_sdr_db = None  # we'll skip SI prints if missing
 
 
-# -----------------------
-# Simple EMA
-# -----------------------
+# =========================
+# State, Callbacks, Scheds
+# =========================
 
-class ModelEMA:
-    """
-    Exponential Moving Average for a torch.nn.Module.
-    Keeps a shadow copy on the same device as the model.
-    """
-
-    def __init__(self, model: nn.Module, beta: float = 0.0):
-        self.beta = float(beta)
-        self.active = self.beta > 0.0
-        self.shadow: Optional[nn.Module] = None
-        if self.active:
-            self.shadow = self._clone(model)
-
-    def _clone(self, model: nn.Module) -> nn.Module:
-        copy = type(model)() if hasattr(type(model), "__call__") else nn.Module()
-        # generic state copy
-        copy.load_state_dict(model.state_dict(), strict=True)
-        for p in copy.parameters():
-            p.requires_grad_(False)
-        copy.to(next(model.parameters()).device, dtype=next(model.parameters()).dtype)
-        return copy
-
-    @torch.no_grad()
-    def update(self, model: nn.Module):
-        if not self.active or self.shadow is None:
-            return
-        msd = model.state_dict()
-        ssd = self.shadow.state_dict()
-        b = self.beta
-        for k in ssd.keys():
-            ssd[k].lerp_(msd[k], 1.0 - b)
-
-    def state_dict(self):
-        if not self.active or self.shadow is None:
-            return {}
-        return self.shadow.state_dict()
-
-    def load_state_dict(self, sd):
-        if self.shadow is not None and sd:
-            self.shadow.load_state_dict(sd, strict=False)
-
-
-# -----------------------
-# Trainer
-# -----------------------
-
-@dataclass
 class TrainState:
-    epoch: int = 0
-    global_step: int = 0
+    def __init__(self):
+        self.epoch: int = 1
+        self.global_step: int = 0
+        self.best: Optional[float] = None
+        self.info: Dict[str, Any] = {}
 
+
+class Callback:
+    def on_fit_begin(self, **kw): pass
+    def on_fit_end(self, **kw): pass
+
+    def on_epoch_begin(self, **kw): pass
+    def on_epoch_end(self, **kw): pass
+
+    def on_batch_start(self, **kw): pass
+    def on_batch_end(self, **kw): pass
+
+    def on_val_begin(self, **kw): pass
+    def on_val_end(self, **kw): pass
+
+    # optional early stop flag
+    should_stop: bool = False
+
+
+class WarmupCosine:
+    """Simple warmup+cosine schedule (optional; not required for constant-LR overfit)."""
+    def __init__(self, optimizer, total_steps: int, warmup: int = 0, min_factor: float = 0.1):
+        self.opt = optimizer
+        self.tot = max(1, int(total_steps))
+        self.warm = max(0, int(warmup))
+        self.minf = float(min_factor)
+        self._step = 0
+        self._base = [g["lr"] for g in self.opt.param_groups]
+
+    def step(self):
+        self._step += 1
+        if self._step <= self.warm:
+            s = self._step / max(1, self.warm)
+        else:
+            prog = (self._step - self.warm) / max(1, self.tot - self.warm)
+            s = self.minf + (1 - self.minf) * 0.5 * (1 + math.cos(math.pi * prog))
+        for pg, b in zip(self.opt.param_groups, self._base):
+            pg["lr"] = b * s
+
+
+# =========
+# Trainer
+# =========
+
+BatchType = Union[Dict[str, Any], List[Any], Tuple[Any, ...]]
 
 class Trainer:
-    """
-    Orchestrates training for a single Task module (which wraps the model).
-    Task forward signature: outputs = task(batch_dict)  -> must include "yhat".
-    Loss signature: total, comps = loss_fn(outputs, batch_dict).
-    """
-
+    # REPLACE your current __init__ signature with this one
     def __init__(
             self,
-            *,
-            task: nn.Module,
-            loss_fn,
-            optimizer: Optimizer,
-            scheduler: Optional[_LRScheduler],
-            run_dir: Path,
-            device: torch.device,
-            amp: str = "off",
+            model: nn.Module,
+            task: nn.Module,  # callable: outputs = task(batch)
+            loss_fn: nn.Module,  # returns (loss_scalar, comps_dict)
+            optimizer: torch.optim.Optimizer,
+            scheduler: Optional[Any] = None,
+            device: Optional[torch.device] = None,
+            amp: str = "float32",
             grad_accum: int = 1,
             grad_clip: float = 0.0,
             channels_last: bool = True,
-            compile: bool = False,
-            ema_beta: float = 0.0,
-            callbacks: Optional[List[Any]] = None,
-            print_every: int = 50,
+            callbacks: Optional[List[Callback]] = None,
+            # ---- NEW (optional, tolerated) ----
+            run_dir: Optional[str] = None,
+            compile: Optional[bool] = None,  # just stored; not used by this class
+            ema_beta: Optional[float] = None,  # stored for callbacks that might read it
+            print_every: Optional[int] = None,
+            **unused,  # swallow any other legacy kwargs safely
     ):
+        self.model = model
         self.task = task
-        # NEW: legacy alias — some callbacks expect trainer.model
-        self.model = self.task
-
         self.loss_fn = loss_fn
-        self.optim = optimizer
+        self.opt = optimizer
         self.sched = scheduler
-        self.run_dir = run_dir
-        self.device = device
-        self.amp = (amp or "off").lower()
+        self.device = torch.device(device) if device is not None else torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        self.amp = str(amp).lower()
         self.grad_accum = max(1, int(grad_accum))
         self.grad_clip = float(grad_clip)
         self.channels_last = bool(channels_last)
-        self.compile = bool(compile)
-        self.ema = ModelEMA(self.task, ema_beta)
-        self.callbacks = callbacks or []
-        self.print_every = int(print_every)
+        self.cbs: List[Callback] = callbacks or []
+        self.state = TrainState()
 
-        self.ckpt_dir = self.run_dir / "checkpoints"
-        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+        # external cfg if scripts set trainer.cfg elsewhere
+        self.cfg: Dict[str, Any] = getattr(self, "cfg", {})
 
-        # placement
-        self.task.to(self.device)
-        set_channels_last(self.task, self.channels_last)
+        # ---- store new extras (optional) ----
+        self.run_dir = run_dir or getattr(self, "run_dir", None)
+        self.compile_requested = bool(compile) if compile is not None else None
+        self.ema_beta = float(ema_beta) if ema_beta is not None else None
+        self._print_every_override = int(print_every) if print_every is not None else None
 
-        # compile if asked (compile the whole task)
-        if self.compile and hasattr(torch, "compile"):
-            self.task = torch.compile(self.task)  # inductor by default
-            print("[compile] torch.compile active (inductor, default)")
-        else:
-            print("[compile] torch.compile inactive")
+        # AMP + scaler (fp16 only)
+        self._autocast_enabled = self.amp in ("float16",)
+        self._autocast_dtype = (
+            torch.float16 if self.amp == "float16"
+            else (torch.bfloat16 if self.amp in ("bfloat16", "bf16") else torch.float32)
+        )
+        self._scaler = torch.cuda.amp.GradScaler(enabled=(self.amp == "float16"))
 
-        # AMP
-        self.autocast = autocast_from_amp(self.amp)
-        self.scaler = torch.amp.GradScaler("cuda", enabled=need_grad_scaler(self.amp))
+        # memory format + device move
+        if self.channels_last and self.device.type == "cuda":
+            self.model = self.model.to(memory_format=torch.channels_last)
+        self.model.to(self.device)
 
-        # Train state
-        self.state = TrainState(epoch=0, global_step=0)
+    # -------------
+    # small helpers
+    # -------------
 
-    # -----------------------
-    # Public API
-    # -----------------------
+    @staticmethod
+    def _bt(x: torch.Tensor) -> torch.Tensor:
+        """(B,C,T)->(B,T) mono; (B,T)->(B,T); (T,)->(1,T)."""
+        if x.dim() == 3:
+            return x.mean(dim=1)
+        if x.dim() == 2:
+            return x
+        if x.dim() == 1:
+            return x.unsqueeze(0)
+        raise RuntimeError(f"Unexpected waveform shape {tuple(x.shape)}")
+
+    def _clone_batch(self, batch: BatchType) -> BatchType:
+        """Deep-ish clone tensors so mutators can safely modify."""
+        if isinstance(batch, dict):
+            return {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in batch.items()}
+        if isinstance(batch, (list, tuple)):
+            out = []
+            for v in batch:
+                out.append(v.detach().clone() if torch.is_tensor(v) else v)
+            return out
+        return batch
+
+    def _to_device(self, batch: BatchType) -> BatchType:
+        """Move tensors to the trainer device."""
+        if isinstance(batch, dict):
+            for k, v in list(batch.items()):
+                if torch.is_tensor(v):
+                    batch[k] = v.to(self.device, non_blocking=True)
+            return batch
+        if isinstance(batch, (list, tuple)):
+            out = []
+            for v in batch:
+                out.append(v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v)
+            return out
+        return batch
+
+    # -------------
+    # public API
+    # -------------
 
     def fit(
-            self,
-            train_loader: Iterable[Dict[str, torch.Tensor]],
-            val_loader: Optional[Iterable[Dict[str, torch.Tensor]]] = None,
-            *,
-            epochs: int,
-            save_every: int = 1,
-            overfit_steps: int = 0,
+        self,
+        train_loader,
+        val_loader=None,
+        epochs: int = 1,
+        overfit_steps: Optional[int] = None,
     ):
+        dbg = self.cfg.get("debug", {}) if isinstance(self.cfg, dict) else {}
+        pbar_every = int(dbg.get("pbar_every", 50))
+        print_comp = bool(dbg.get("print_comp", True))
+        print_sisdr = bool(dbg.get("print_sisdr", False))
+        val_every = int(dbg.get("val_every", 1))
+        val_max_batches = int(dbg.get("val_max_batches", 0))
+        of_steps = int(dbg.get("overfit_steps", overfit_steps or 0))
+
         # callbacks: fit begin
-        for cb in self.callbacks:
-            fn = getattr(cb, "on_fit_begin", None)
-            if callable(fn): fn(self)
+        for cb in self.cbs:
+            try:
+                cb.on_fit_begin(trainer=self, state=self.state)
+            except Exception as e:
+                print(f"[cb-warn] on_fit_begin: {e}")
 
-        total_epochs = int(epochs)
-        steps_per_epoch = (overfit_steps or len(train_loader))
-        total_steps = total_epochs * steps_per_epoch
+        for epoch in range(1, epochs + 1):
+            self.state.epoch = epoch
+            used, tr_loss, tr_comps, tr_time = self._run_train_epoch(
+                train_loader, epoch, of_steps, pbar_every, print_comp, print_sisdr
+            )
 
-        # One-line summary (mirrors your style)
-        print("\n===== TRAINING SUMMARY =====")
-        print(f"device={self.device} | amp={self.amp} | channels_last={self.channels_last}")
-        n_params = sum(p.numel() for p in self.task.parameters())
-        n_trainable = sum(p.numel() for p in self.task.parameters() if p.requires_grad)
-        print(f"params: {n_trainable:,} trainable / {n_params:,} total")
-        print(f"batch={getattr(train_loader, 'batch_size', '?')} | "
-              f"workers={getattr(train_loader, 'num_workers', '?')}")
-        print(f"epochs={total_epochs} | steps/epoch={steps_per_epoch} | total_steps={total_steps}")
-        print(f"grad_accum={self.grad_accum} | grad_clip={self.grad_clip} | optimizer={type(self.optim).__name__}")
-        if self.sched is not None:
-            print("scheduler=LR scheduler enabled")
-        print(f"ema={format_ema(getattr(self.ema, 'beta', 0.0))}")
-        print(f"compile={'on' if self.compile else 'off'} (torch.compile)\n================================\n")
-
-        # main loop
-        for epoch in range(self.state.epoch + 1, self.state.epoch + 1 + total_epochs):
-            # callbacks: epoch begin
-            # Call both new-style and legacy epoch-begin hooks
-            for cb in self.callbacks:
-                fn = getattr(cb, "on_epoch_begin", None)
-                if callable(fn): fn(self, epoch)
-                fn_legacy = getattr(cb, "on_epoch_start", None)
-                if callable(fn_legacy): fn_legacy(trainer=self, state=self.state)
-
-            start_t = time.time()
-            tr_loss, tr_items = self._run_train_epoch(train_loader, epoch, overfit_steps)
-            if val_loader is not None:
-                for cb in self.callbacks:
-                    fn = getattr(cb, "on_val_start", None)
-                    if callable(fn): fn(trainer=self, state=self.state)
-                val_loss, val_items = self._run_val_epoch(val_loader, epoch)
-                for cb in self.callbacks:
-                    fn = getattr(cb, "on_val_end", None)
-                    if callable(fn):
-                        fn(trainer=self, state=self.state,
-                           train_loss=tr_loss, val_loss=val_loss,
-                           train_comps=None, val_comps=None,
-                           train_used=tr_items, train_skipped=0,
-                           epoch_time=0.0)
-            else:
-                val_loss, val_items = (float("nan"), 0)
-
-            elapsed = time.time() - start_t
-            lr = self.optim.param_groups[0]["lr"]
-
-            # Epoch report (concise)
-            print(f"[epoch {epoch:03d}] train {tr_loss:.4f} | val {val_loss:.4f} | "
-                  f"used {tr_items} | lr {lr:.2e} | {elapsed:.1f}s")
+            # ---- validation ----
+            va_loss = None
+            if (val_loader is not None) and (val_every <= 1 or (epoch % val_every) == 0):
+                print(f"----- VALIDATION {epoch:03d} -----")
+                va_loss = self._run_valid_epoch(val_loader, val_max_batches)
+                print(f"[val-done {epoch:03d}] avg_loss={va_loss:.4f} | used={1 if val_max_batches==1 else 'auto'}")
 
             # callbacks: epoch end
-            for cb in self.callbacks:
-                fn = getattr(cb, "on_epoch_end", None)
-                if callable(fn): fn(self, epoch)
-
-            # checkpoint
-            if epoch % max(1, int(save_every)) == 0:
-                self.save_checkpoint(epoch)
-
-        # callbacks: fit end
-        for cb in self.callbacks:
-            fn = getattr(cb, "on_fit_end", None)
-            if callable(fn): fn(self)
-
-    # -----------------------
-    # Internals
-    # -----------------------
-
-    def _maybe_zero_grad(self, step_idx: int):
-        if step_idx % self.grad_accum == 0:
-            self.optim.zero_grad(set_to_none=True)
-
-    def _backward_step(self, loss: torch.Tensor):
-        if self.scaler.is_enabled():
-            self.scaler.scale(loss).backward()
-        else:
-            loss.backward()
-
-    def _optimizer_step(self):
-        if self.scaler.is_enabled():
-            self.scaler.step(self.optim)
-            self.scaler.update()
-        else:
-            self.optim.step()
-
-    def _run_train_epoch(
-            self,
-            loader: Iterable[Dict[str, torch.Tensor]],
-            epoch: int,
-            overfit_steps: int = 0,
-    ) -> Tuple[float, int]:
-        self.task.train()
-        running = 0.0
-        n_items = 0
-        step_in_epoch = 0
-
-        if overfit_steps > 0:
-            # cache first batch and reuse
-            _first = next(iter(loader))
-            _first = move_to(_first, self.device)
-            cached = _first
-
-        for batch_idx, batch in enumerate(loader):
-            if overfit_steps > 0 and batch_idx >= 1:
-                batch = cached
-            else:
-                batch = move_to(batch, self.device)
-
-            # Legacy per-batch start (needed by ProcNoiseAugmentCallback)
-            # ---------- legacy on_batch_start (PHASE 1: noise mutators) ----------
-            # run known mutators first (ProcNoiseAugmentCallback, EnsureMinSNRCallback)
-            for cb in self.callbacks:
-                fn = getattr(cb, "on_batch_start", None)
-                if not callable(fn):
-                    continue
-                # heuristic: mutators have a 'noise' attribute or class name contains 'Noise' or 'MinSNR'
-                cname = cb.__class__.__name__.lower()
-                if hasattr(cb, "noise") or "noise" in cname or "minsnr" in cname:
-                    try:
-                        fn(trainer=self, state=self.state, batch=batch)
-                    except Exception as e:
-                        print(f"[cb-warn] on_batch_start(mutator) error: {e}")
-
-            # ---------- legacy on_batch_start (PHASE 2: the rest) ----------
-            for cb in self.callbacks:
-                fn = getattr(cb, "on_batch_start", None)
-                if not callable(fn):
-                    continue
-                cname = cb.__class__.__name__.lower()
-                if hasattr(cb, "noise") or "noise" in cname or "minsnr" in cname:
-                    continue  # already ran
+            for cb in self.cbs:
                 try:
-                    fn(trainer=self, state=self.state, batch=batch)
+                    cb.on_epoch_end(trainer=self, state=self.state,
+                                    train_loss=tr_loss, train_comps=tr_comps,
+                                    val_loss=va_loss, epoch_time=tr_time)
                 except Exception as e:
-                    print(f"[cb-warn] on_batch_start error: {e}")
-            # forward + loss
-            with self.autocast:
-                outputs = self.task(batch)
-                total_loss, comps = self.loss_fn(outputs, batch)
-                # ensure float32 scalar
-                if torch.is_tensor(total_loss):
-                    loss = total_loss.mean()
-                else:
-                    loss = torch.as_tensor(total_loss, dtype=torch.float32, device=self.device)
+                    print(f"[cb-warn] on_epoch_end: {e}")
 
-            # backward / step (with grad-accum)
-            self._maybe_zero_grad(self.state.global_step + 1)
-            self._backward_step(loss / self.grad_accum)
-
-            if self.grad_clip > 0.0:
-                if self.scaler.is_enabled():
-                    self.scaler.unscale_(self.optim)
-                clip_grad_norm_(self.task.parameters(), self.grad_clip)
-
-            if (self.state.global_step + 1) % self.grad_accum == 0:
-                self._optimizer_step()
-                if self.sched is not None:
-                    self.sched.step()
-                # EMA after optimizer step
-                self.ema.update(self.task)
-
-            self.state.global_step += 1
-            step_in_epoch += 1
-
-            # running stats
-            running += float(loss.detach().item())
-            n_items += 1
-
-            # callbacks: train-batch-end
-            # new-style batch-end (already present)
-            for cb in self.callbacks:
-                fn = getattr(cb, "on_train_batch_end", None)
-                if callable(fn):
-                    try:
-                        fn(self, batch_idx, batch, outputs)
-                    except Exception as e:
-                        print(f"[cb-warn] on_train_batch_end error: {e}")
-
-            # legacy batch-end
-            for cb in self.callbacks:
-                fn_legacy = getattr(cb, "on_batch_end", None)
-                if callable(fn_legacy):
-                    try:
-                        fn_legacy(trainer=self, state=self.state, batch=batch, outputs=outputs)
-                    except Exception as e:
-                        print(f"[cb-warn] on_batch_end error: {e}")
-
-            if overfit_steps > 0 and step_in_epoch >= overfit_steps:
+            # early stop?
+            if any(getattr(cb, "should_stop", False) for cb in self.cbs):
+                print("[trainer] early stop requested by callback.")
                 break
 
-            if self.print_every and (batch_idx + 1) % self.print_every == 0:
-                lr = self.optim.param_groups[0]["lr"]
-                print(f"train {epoch:03d}: {batch_idx + 1}/{overfit_steps or len(loader)} | "
-                      f"loss={running / max(1, n_items):.4f} | lr={lr:.2e}")
+            print(f"[train-done {epoch:03d}] used {used} steps | avg_loss={tr_loss:.4f} | time={tr_time:.1f}s | lr={self.opt.param_groups[0]['lr']:.2e}")
 
-        return running / max(1, n_items), n_items
+        for cb in self.cbs:
+            try:
+                cb.on_fit_end(trainer=self, state=self.state)
+            except Exception as e:
+                print(f"[cb-warn] on_fit_end: {e}")
+
+    # -----------------
+    # internal epochs
+    # -----------------
+
+    def _run_train_epoch(
+        self,
+        loader,
+        epoch: int,
+        overfit_steps: int,
+        pbar_every: int,
+        print_comp: bool,
+        print_sisdr: bool,
+    ) -> Tuple[int, float, Dict[str, float], float]:
+        self.model.train(True)
+
+        # one-time cached batch for true overfit
+        cached = None
+        steps_goal: int
+        if overfit_steps and overfit_steps > 0:
+            try:
+                first = next(iter(loader))
+            except StopIteration:
+                raise RuntimeError("Empty train loader in overfit mode.")
+            cached = self._to_device(self._clone_batch(first))
+            steps_goal = overfit_steps
+            print(f"[overfit] repeating the same batch for {steps_goal} steps.")
+        else:
+            steps_goal = len(loader)
+
+        t0 = time.time()
+        used = 0
+        total_loss = 0.0
+        comps_accum: Dict[str, float] = {}
+
+        # allow callbacks to prepare the epoch
+        for cb in self.cbs:
+            try:
+                cb.on_epoch_begin(trainer=self, state=self.state)
+            except Exception as e:
+                print(f"[cb-warn] on_epoch_begin: {e}")
+
+        loader_iter = iter(loader)
+
+        for step in range(steps_goal):
+            # prepare batch
+            if cached is not None:
+                batch = self._clone_batch(cached)
+            else:
+                try:
+                    batch = next(loader_iter)
+                except StopIteration:
+                    loader_iter = iter(loader)
+                    batch = next(loader_iter)
+                batch = self._to_device(batch)
+
+            # on_batch_start (mutators can modify batch here)
+            for cb in self.cbs:
+                try:
+                    cb.on_batch_start(trainer=self, state=self.state, batch=batch)
+                except Exception as e:
+                    print(f"[cb-warn] on_batch_start error: {e}")
+
+            # forward + loss
+            with torch.autocast(
+                device_type=("cuda" if self.device.type == "cuda" else "cpu"),
+                dtype=self._autocast_dtype,
+                enabled=self._autocast_enabled,
+            ):
+                outputs = self.task(batch)
+                loss, comps = self.loss_fn(outputs, batch)
+
+            # backward
+            if self._autocast_enabled:
+                self._scaler.scale(loss / self.grad_accum).backward()
+                if (self.state.global_step + 1) % self.grad_accum == 0:
+                    if self.grad_clip > 0:
+                        self._scaler.unscale_(self.opt)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    self._scaler.step(self.opt)
+                    self._scaler.update()
+                    self.opt.zero_grad(set_to_none=True)
+            else:
+                (loss / self.grad_accum).backward()
+                if (self.state.global_step + 1) % self.grad_accum == 0:
+                    if self.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    self.opt.step()
+                    self.opt.zero_grad(set_to_none=True)
+
+            # track
+            used += 1
+            self.state.global_step += 1
+            l_val = float(loss.detach().to("cpu"))
+            total_loss += l_val
+            if isinstance(comps, dict):
+                for k, v in comps.items():
+                    try:
+                        comps_accum[k] = comps_accum.get(k, 0.0) + float(v)
+                    except Exception:
+                        pass
+
+            # on_batch_end (pass outputs/loss for savers)
+            for cb in self.cbs:
+                try:
+                    cb.on_batch_end(trainer=self, state=self.state, batch=batch,
+                                    outputs=outputs, loss=l_val)
+                except Exception as e:
+                    print(f"[cb-warn] on_batch_end error: {e}")
+
+            # progress line
+            if pbar_every and ((step + 1) % pbar_every == 0 or (step + 1) == steps_goal):
+                # grad norm (best-effort)
+                try:
+                    gn = torch.nn.utils.clip_grad_norm_(self.model.parameters(), float("inf"))
+                    grad_norm_str = f"{float(gn):.3e}"
+                except Exception:
+                    grad_norm_str = "n/a"
+
+                # L1(n,c) vs L1(y,c)
+                l1_str = ""
+                try:
+                    noisy, clean = None, None
+                    if isinstance(batch, dict):
+                        noisy, clean = batch.get("noisy", None), batch.get("clean", None)
+                    elif isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                        noisy, clean = batch[0], batch[1]
+                    if noisy is not None and clean is not None and torch.is_tensor(outputs.get("yhat", None)):
+                        nb = self._bt(noisy); cb = self._bt(clean); yb = self._bt(outputs["yhat"])
+                        nT = min(nb.shape[-1], cb.shape[-1], yb.shape[-1])
+                        mae_n = torch.mean(torch.abs(nb[..., :nT] - cb[..., :nT])).item()
+                        mae_y = torch.mean(torch.abs(yb[..., :nT] - cb[..., :nT])).item()
+                        l1_str = f" | L1(n,c)={mae_n:.4f} -> L1(y,c)={mae_y:.4f}"
+                except Exception:
+                    pass
+
+                # SI-SDR delta (optional)
+                sisdr_str = ""
+                if print_sisdr and si_sdr_db is not None:
+                    try:
+                        nb = self._bt(noisy); cbv = self._bt(clean); yb = self._bt(outputs["yhat"])
+                        nT = min(nb.shape[-1], cbv.shape[-1], yb.shape[-1])
+                        si_n = si_sdr_db(nb[..., :nT], cbv[..., :nT]).mean().item()
+                        si_y = si_sdr_db(yb[..., :nT], cbv[..., :nT]).mean().item()
+                        sisdr_str = f" | SI {si_n:+.2f}→{si_y:+.2f} dB"
+                    except Exception:
+                        pass
+
+                comp_str = ""
+                if print_comp and isinstance(comps, dict) and comps:
+                    try:
+                        comp_str = " | " + " ".join(f"{k}={float(v):.4f}" for k, v in sorted(comps.items()))
+                    except Exception:
+                        pass
+                else:
+                    print(type(comps), comp_str)
+
+                lr = self.opt.param_groups[0]["lr"]
+                print(f"[train {epoch:03d}] step {step+1:5d}/{steps_goal} | loss={l_val:.4f}{l1_str}{sisdr_str}{comp_str} | lr={lr:.2e} | grad_norm={grad_norm_str}")
+
+            # step scheduler if any
+            if self.sched is not None:
+                try:
+                    self.sched.step()
+                except Exception:
+                    pass
+
+        dt = time.time() - t0
+        avg_loss = total_loss / max(1, used)
+        avg_comps = {k: v / max(1, used) for k, v in comps_accum.items()}
+        return used, avg_loss, avg_comps, dt
 
     @torch.no_grad()
-    def _run_val_epoch(
-            self,
-            loader: Iterable[Dict[str, torch.Tensor]],
-            epoch: int,
-    ) -> Tuple[float, int]:
-        self.task.eval()
-        running = 0.0
-        n_items = 0
-
-        for batch_idx, batch in enumerate(loader):
-            batch = move_to(batch, self.device)
-            with self.autocast:
-                outputs = self.task(batch)
-                total_loss, _ = self.loss_fn(outputs, batch)
-                if torch.is_tensor(total_loss):
-                    loss = total_loss.mean()
-                else:
-                    loss = torch.as_tensor(total_loss, dtype=torch.float32, device=self.device)
-            running += float(loss.item())
-            n_items += 1
-
-        return running / max(1, n_items), n_items
-
-    # -----------------------
-    # Checkpointing
-    # -----------------------
-
-    def save_checkpoint(self, epoch: int):
-        ckpt = dict(
-            epoch=epoch,
-            global_step=self.state.global_step,
-            task_state=self.task.state_dict(),
-            optim_state=self.optim.state_dict(),
-            sched_state=(self.sched.state_dict() if self.sched is not None else None),
-            ema_state=self.ema.state_dict(),
-        )
-        path = self.ckpt_dir / f"epoch_{epoch:03d}.pt"
-        torch.save(ckpt, path)
-        print(f"[ckpt] saved {path}")
-
-    def resume(self, path: Path) -> Tuple[int, int]:
-        ck = latest_checkpoint(path)
-        if ck is None:
-            raise FileNotFoundError(f"No checkpoint found at {path}")
-        sd = torch.load(ck, map_location="cpu")
-        # Try loading task (preferred) — contains model submodules.
-        tstate = sd.get("task_state", None)
-        if tstate:
-            load_state_dict_loose(self.task, tstate, "task")
-        else:
-            # legacy: try model key
-            mstate = sd.get("model_state", None)
-            if mstate:
-                load_state_dict_loose(self.task, mstate, "model")
-        # Optimizer / scheduler
-        try:
-            self.optim.load_state_dict(sd.get("optim_state", {}))
-        except Exception as e:
-            print(f"[resume] optimizer load warning: {e}")
-        if self.sched is not None and sd.get("sched_state", None) is not None:
+    def _run_valid_epoch(self, val_loader, val_max_batches: int) -> float:
+        self.model.train(False)
+        for cb in self.cbs:
             try:
-                self.sched.load_state_dict(sd["sched_state"])
+                cb.on_val_begin(trainer=self, state=self.state)
             except Exception as e:
-                print(f"[resume] scheduler load warning: {e}")
-        # EMA
-        try:
-            self.ema.load_state_dict(sd.get("ema_state", {}))
-        except Exception as e:
-            print(f"[resume] ema load warning: {e}")
+                print(f"[cb-warn] on_val_begin: {e}")
 
-        last_epoch = int(sd.get("epoch", 0))
-        gstep = int(sd.get("global_step", 0))
-        print(f"[resume] loaded {ck} | last_epoch={last_epoch} | global_step={gstep}")
-        self.state.epoch = last_epoch
-        self.state.global_step = gstep
-        return last_epoch, gstep
+        total = 0.0
+        used = 0
+        it = iter(val_loader)
+        steps = val_max_batches if val_max_batches and val_max_batches > 0 else len(val_loader)
+
+        for _ in range(steps):
+            try:
+                batch = next(it)
+            except StopIteration:
+                break
+            batch = self._to_device(batch)
+
+            with torch.autocast(
+                device_type=("cuda" if self.device.type == "cuda" else "cpu"),
+                dtype=self._autocast_dtype,
+                enabled=self._autocast_enabled,
+            ):
+                outputs = self.task(batch)
+                loss, comps = self.loss_fn(outputs, batch)
+
+            total += float(loss.detach().to("cpu"))
+            used += 1
+
+        va_loss = total / max(1, used)
+
+        for cb in self.cbs:
+            try:
+                cb.on_val_end(trainer=self, state=self.state, val_loss=va_loss)
+            except Exception as e:
+                print(f"[cb-warn] on_val_end: {e}")
+
+        return va_loss

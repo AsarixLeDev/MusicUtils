@@ -19,7 +19,6 @@ class ProcNoiseAugmentCallback(Callback):
         self.prob = float(prob)
         self.snr_min = float(snr_min)
         self.snr_max = float(snr_max)
-        self.out_peak = float(out_peak)
         self.train_only = bool(train_only)
         self.noise = NoiseFactory(self.sr, noise_cfg or {})
         self.track = bool(track_stats)
@@ -29,6 +28,9 @@ class ProcNoiseAugmentCallback(Callback):
         self.fixed_per_epoch = bool(fixed_per_epoch)
         self._fixed_noises = None  # type: Optional[torch.Tensor]
         self.require_replace = bool(require_replace)
+        self.out_peak = (None if noise_cfg is not None and noise_cfg.get("out_peak", None) is None
+                         else (None if out_peak is None else float(out_peak)))
+        self.require_replace = bool(getattr(self, "require_replace", False))
 
     def on_epoch_start(self, **_):
         self._seen = 0;
@@ -98,12 +100,15 @@ class ProcNoiseAugmentCallback(Callback):
         elif self.fixed_per_epoch:
             if self._fixed_noises is None:
                 self._fixed_noises = self.noise.sample_batch(B, T, device=device).to(noise_dtype)
-            noises = self._fixed_noises.clone()
+            noises = self._fixed_noises
         else:
             noises = self.noise.sample_batch(B, T, device=device).to(noise_dtype)
 
         snrs = torch.empty(B, device=device, dtype=torch.float32).uniform_(self.snr_min, self.snr_max)
-        new_noisy_bt = mix_at_snr(clean_bt, noises, snrs, peak=self.out_peak)  # (B,T) float32
+        if self.out_peak is None:
+            new_noisy_bt = mix_at_snr(clean_bt, noises, snrs)  # omit 'peak' kw
+        else:
+            new_noisy_bt = mix_at_snr(clean_bt, noises, snrs, peak=float(self.out_peak))
 
         # detect aliasing (shared storage between noisy and clean)
         same_mem = False
@@ -153,7 +158,10 @@ class ProcNoiseAugmentCallback(Callback):
                 post_snr = float((10.0 * torch.log10(num / den)).mean().item())
                 print(f"[proc-noise] post-mix SNR ~ {post_snr:+.2f} dB")
         except Exception:
+            print("[cb-warn] proc-noise error")
             pass
+        # if self.require_replace and self._seen == self._repl:
+        #     print("[proc-noise][WARN] require_replace=True but batch not replaced; check prob/snr/shape.")
         if self.require_replace:
             # re-read from container in case we reassigned
             noisy2 = batch["noisy"] if isinstance(batch, dict) else (

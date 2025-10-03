@@ -5,7 +5,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
-from torch.utils.data import DataLoader
+import torch
+from torch.utils.data import DataLoader, Subset
 
 try:
     from .music_denoise_dataset import MusicDenoiseDataset
@@ -51,11 +52,11 @@ def _inst(cls, manifest: Path, split: str, dcfg: Dict[str, Any]):
         raise
 
 
-def _mk_loader(ds, dcfg: Dict[str, Any], train: bool) -> DataLoader:
+def _mk_loader(ds, dcfg: Dict[str, Any], shuffle: bool) -> DataLoader:
     bs = int(dcfg.get("batch", 12))
     nw = int(dcfg.get("workers", 0))
     pin = bool(dcfg.get("pin_memory", True))
-    args = dict(batch_size=bs, shuffle=train, num_workers=nw, pin_memory=pin)
+    args = dict(batch_size=bs, shuffle=shuffle, num_workers=nw, pin_memory=pin)
     pf = dcfg.get("prefetch_factor", None)
     if pf is not None and nw > 0:
         args["prefetch_factor"] = int(pf)
@@ -63,6 +64,8 @@ def _mk_loader(ds, dcfg: Dict[str, Any], train: bool) -> DataLoader:
     collate = getattr(ds, "collate_fn", None)
     if callable(collate):
         args["collate_fn"] = collate
+    else:
+        pass
     return DataLoader(ds, **args)
 
 
@@ -76,14 +79,38 @@ def build_loaders(cfg: Dict[str, Any]):
     if tr_cls is None:
         raise ImportError(f"No dataset class available for kind='{tr_kind}'")
     tr_ds = _inst(tr_cls, tr_manifest, split="train", dcfg=dcfg)
-    tr_ld = _mk_loader(tr_ds, dcfg, train=True)
+
+    fixed_idx = dcfg.get("fixed_index", None)
+    fixed_crop = dcfg.get("fixed_crop_sec", None)
+
+    if hasattr(tr_ds, "set_fixed_crop_sec"):
+        tr_ds.set_fixed_crop_sec(fixed_crop)
+
+    if fixed_idx is not None:
+        tr_ds = Subset(tr_ds, [int(fixed_idx)])
+        shuffle = False
+    else:
+        shuffle = True
+
+    tr_ld = _mk_loader(tr_ds, dcfg, shuffle)
 
     va_ld = None
     if va_manifest and va_manifest.exists():
         va_kind = _peek_kind(va_manifest)
         va_cls = _pick_dataset(va_kind) or tr_cls
         va_ds = _inst(va_cls, va_manifest, split="val", dcfg=dcfg)
-        va_ld = _mk_loader(va_ds, dcfg, train=False)
+        fixed_val_idx = dcfg.get("fixed_val_index", None)
+        fixed_val_crop = dcfg.get("fixed_val_crop_sec", None)
+
+        if hasattr(va_ds, "set_fixed_crop_sec"):
+            va_ds.set_fixed_crop_sec(fixed_val_crop)
+
+        if (va_ds is not None) and (fixed_val_idx is not None):
+            va_ds = Subset(va_ds, [int(fixed_val_idx)])
+
+        va_ld = None
+        if va_ds is not None:
+            va_ld = _mk_loader(va_ds, dcfg, False)
 
     info = dict(
         train=dict(kind=tr_kind, n=len(tr_ds)),

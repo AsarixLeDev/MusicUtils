@@ -125,6 +125,18 @@ def main():
     # Build model + task
     # -----------------------
     model = create_model(cfg["model"]["name"], **(cfg["model"].get("args") or {}))
+
+    def freeze_batchnorm(m):
+        import torch.nn as nn
+        for mod in m.modules():
+            if isinstance(mod, nn.BatchNorm1d) or isinstance(mod, nn.BatchNorm2d) or isinstance(mod, nn.BatchNorm3d):
+                mod.eval()
+                mod.track_running_stats = False
+
+    # For overfit sanity only:
+    if bool(cfg.get("debug", {}).get("freeze_bn", True)):
+        freeze_batchnorm(model)
+        print("[model] BatchNorm frozen for overfit sanity")
     # Create task module that wraps the model and implements forward(batch)->outputs
     task = create_task(cfg["task"]["name"], model=model, **(cfg["task"].get("args") or {}))
 
@@ -138,7 +150,15 @@ def main():
     # -----------------------
     optim = _build_optimizer(task, cfg["optim"])
     total_steps = (cfg["train"].get("epochs", 1)) * (cfg["debug"].get("overfit_steps", 0) or len(tr_loader))
-    sched = _build_warmup_cosine(optim, total_steps, cfg["optim"]) if cfg["optim"].get("use_scheduler", True) else None
+    # after optimizer creation
+    constant_lr = bool(cfg.get("debug", {}).get("constant_lr", True))  # default True for overfit sanity
+    if constant_lr:
+        sched = None
+        print("[optim] constant LR (scheduler disabled)")
+    else:
+        sched = _build_warmup_cosine(optim, total_steps, cfg["optim"]) if cfg["optim"].get("use_scheduler", True) else None
+
+
 
     # -----------------------
     # Callbacks
@@ -161,17 +181,32 @@ def main():
     cb_cfg = cfg.get("callbacks", {})
 
     if ProcNoiseAugmentCallback is not None and cb_cfg.get("proc_noise", {}).get("enable", False):
-        pn = cb_cfg["proc_noise"]
+        # support both flattened and nested ("args") styles
+        _pn = cb_cfg["proc_noise"]
+        pn_args = dict(_pn.get("args", {})) if isinstance(_pn.get("args"), dict) else dict(_pn)
+
+        # if not explicitly given here, fall back to data.out_peak
+        out_peak = pn_args.get("out_peak", cfg.get("data", {}).get("out_peak", 0.98))
+        # allow YAML null -> Python None to mean "no re-peak"
+        out_peak = None if (out_peak is None or str(out_peak).lower() == "none") else float(out_peak)
+
         cbs.append(ProcNoiseAugmentCallback(
             sr=int(cfg["data"]["sr"]),
-            prob=float(pn.get("prob", 0.5)),
-            snr_min=float(pn.get("snr_min", 0.0)),
-            snr_max=float(pn.get("snr_max", 20.0)),
-            out_peak=float(cfg["data"].get("out_peak", 0.98)),
-            train_only=True,
-            noise_cfg=pn.get("noise_cfg", {})
+            prob=float(pn_args.get("prob", 0.5)),
+            snr_min=float(pn_args.get("snr_min", 0.0)),
+            snr_max=float(pn_args.get("snr_max", 20.0)),
+            out_peak=out_peak,
+            train_only=bool(pn_args.get("train_only", True)),
+            noise_cfg=pn_args.get("noise_cfg", {}),
+            track_stats=bool(pn_args.get("track_stats", True)),
+            fixed_seed=pn_args.get("fixed_seed", None),
+            fixed_per_epoch=bool(pn_args.get("fixed_per_epoch", False)),
+            require_replace=bool(pn_args.get("require_replace", False)),
         ))
-        print("[callbacks] ProcNoiseAugmentCallback enabled")
+        print("[callbacks] ProcNoiseAugmentCallback enabled",
+              f"(prob={pn_args.get('prob')}, snr=[{pn_args.get('snr_min')},{pn_args.get('snr_max')}], "
+              f"fixed_seed={pn_args.get('fixed_seed')}, fixed_per_epoch={pn_args.get('fixed_per_epoch')}, "
+              f"out_peak={out_peak})")
 
     # (optional) rescue items that are still too clean after dataset/proc:
     if EnsureMinSNRCallback is not None and cb_cfg.get("ensure_min_snr", {}).get("enable", False):
@@ -231,6 +266,7 @@ def main():
     # -----------------------
     amp = _infer_amp(cfg)
     trainer = Trainer(
+        model=model,
         task=task,
         loss_fn=loss_fn,
         optimizer=optim,
@@ -244,11 +280,11 @@ def main():
         compile=bool(cfg["runtime"].get("compile", False)),
         ema_beta=float(cfg["train"].get("ema", 0.0)),
         callbacks=cbs,
-        print_every=int(cfg.get("debug", {}).get("pbar_every", 50)),
+        print_every=int(cfg.get("debug", {}).get("pbar_every", 50))
     )
 
     # Optional resume
-    if args.resume:
+    if args.get("resume", None):
         try:
             trainer.resume(Path(args.resume))
         except Exception as e:
@@ -258,7 +294,7 @@ def main():
     _print_training_banner(run_dir, cfg)
 
     # Eval-only branch
-    if args.eval_only:
+    if args.get("eval_only", False):
         if va_loader is None:
             print("[eval-only] No validation loader configured.")
             return
@@ -271,7 +307,6 @@ def main():
         tr_loader,
         va_loader,
         epochs=int(cfg["train"]["epochs"]),
-        save_every=int(cfg["train"].get("save_every", 1)),
         overfit_steps=int(cfg.get("debug", {}).get("overfit_steps", 0)),
     )
 

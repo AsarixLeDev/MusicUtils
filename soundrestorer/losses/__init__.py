@@ -2,6 +2,8 @@
 from .l1_wave import L1WaveLoss
 from .mrstft import MRSTFTLoss
 from .sisdr_pos import SISDRPositiveLoss
+from .lsd import LogSpectralDistance
+__all__ = ["LogSpectralDistance"]
 
 LOSS_REGISTRY = {
     "l1_wave": L1WaveLoss,

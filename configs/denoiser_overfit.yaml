@@ -22,7 +22,7 @@ model:
 task:
   name: denoise_stft
   args:
-    mask_variant: mag_sigmoid
+    mask_variant: complex_delta
     mask_floor: 0.92          # conservative bounds for stability
     mask_limit: 1.08
     clamp_mask_tanh: 0.0

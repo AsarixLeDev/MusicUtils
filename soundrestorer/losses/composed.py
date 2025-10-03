@@ -9,19 +9,18 @@ import torch.nn as nn
 from .l1_wave import L1WaveLoss
 from .mrstft import MRSTFTLoss
 from .sisdr_pos import SISDRPositiveLoss  # adjust name if your file defines a different class
+from .lsd import LogSpectralDistance  # <-- add this
+from .mask_unity_reg import MaskUnityReg
 
-try:
-    from .mask_unity_reg import MaskUnityReg
-except Exception:
-    MaskUnityReg = None
-
+# in REG mapping (or equivalent), add:
 REG = {
     "mrstft": MRSTFTLoss,
     "l1_wave": L1WaveLoss,
-    "sisdr_pos": SISDRPositiveLoss,
+    "sisdr_pos": SISDRPositiveLoss,   # if you have it
+    "lsd": LogSpectralDistance,       # <-- add this line
+    "mask_unity_reg": MaskUnityReg, # if present
 }
-if MaskUnityReg is not None:
-    REG["mask_unity_reg"] = MaskUnityReg
+
 
 
 class ComposedLoss(nn.Module):

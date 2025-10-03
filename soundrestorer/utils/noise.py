@@ -4,6 +4,8 @@ import math
 import random
 import torch
 
+from typing import Optional
+
 
 def _rms(x, dim=-1, keepdim=True):
     return torch.sqrt(torch.clamp(torch.mean(x ** 2, dim=dim, keepdim=keepdim), min=1e-12))
@@ -17,18 +19,34 @@ def _to_bt(x: torch.Tensor) -> torch.Tensor:
     raise RuntimeError(f"mix_at_snr expects 1/2/3D, got {tuple(x.shape)}")
 
 
-def mix_at_snr(clean: torch.Tensor, noise: torch.Tensor, snr_db: torch.Tensor, peak=0.98):
-    clean_bt = _to_bt(clean)
-    noise_bt = _to_bt(noise)
-    B, T = clean_bt.shape
-    cr = _rms(clean_bt)
-    nr = _rms(noise_bt) + 1e-12
-    target_nr = cr / (10.0 ** (snr_db.view(B, 1) / 20.0))
-    noise_bt = noise_bt * (target_nr / nr)
-    y = clean_bt + noise_bt
-    m = torch.max(torch.abs(y), dim=-1, keepdim=True).values.clamp_min(1e-8)
-    scale = torch.clamp(peak / m, max=1.0)
-    return y * scale  # (B,T)
+def mix_at_snr(clean_bt: torch.Tensor, noise_bt: torch.Tensor, snr_db: torch.Tensor | float,
+               peak: Optional[float] = 0.98, eps: float = 1e-12) -> torch.Tensor:
+    """
+    clean_bt, noise_bt: (B,T) float32/-1..1
+    snr_db:             (B,) or scalar
+    peak:               float -> peak-normalize mixture; None -> no re-peak normalization
+    """
+    clean = clean_bt
+    noise = noise_bt
+
+    if isinstance(snr_db, (int, float)):
+        snr_db = torch.full((clean.shape[0],), float(snr_db), device=clean.device, dtype=clean.dtype)
+
+    # energies
+    Pc = torch.mean(clean**2, dim=-1, keepdim=True).clamp_min(eps)
+    Pn = torch.mean(noise**2, dim=-1, keepdim=True).clamp_min(eps)
+
+    # scale noise for target SNR
+    alpha = torch.sqrt(Pc / (Pn * (10.0 ** (snr_db.view(-1, 1) / 10.0))))
+    mix = clean + alpha * noise  # (B,T)
+
+    if peak is not None:
+        # re-peak normalize (cap at 'peak', do not boost if already below)
+        maxabs = mix.abs().amax(dim=-1, keepdim=True).clamp_min(eps)
+        g = torch.clamp(torch.tensor(float(peak), device=mix.device, dtype=mix.dtype) / maxabs, max=1.0)
+        mix = mix * g
+
+    return mix
 
 
 def _colored_noise(color: str, shape, device):

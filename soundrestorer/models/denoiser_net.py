@@ -71,7 +71,7 @@ class ComplexUNet(nn.Module):
       enc1.net.0.conv.weight, up4.conv.0.bn.weight, out.weight, ...
     """
 
-    def __init__(self, base: int = 48):
+    def __init__(self, base: int = 48, **_):
         super().__init__()
         b1 = base
         b2 = base * 2

@@ -3,10 +3,12 @@
 
 from .audio_debug import AudioDebugCallback
 from .data_audit import DataAuditCallback
+from .save_preds import SavePredsEveryNStepsCallback
 from .utils import save_wav_triads
 
 __all__ = [
     "save_wav_triads",
     "AudioDebugCallback",
     "DataAuditCallback",
+    "SavePredsEveryNStepsCallback"
 ]

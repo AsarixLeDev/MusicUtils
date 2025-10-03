@@ -18,6 +18,17 @@ import torch
 import torch.nn as nn  # add near top if not present
 
 from ..utils.audio import get_stft_window
+from torch._dynamo import disable
+
+@disable  # ensure this runs outside the compiled graph
+def to_float(val):
+    try:
+        return float(val.detach().cpu().item())
+    except Exception:
+        try:
+            return float(val)
+        except Exception:
+            return float("nan")
 
 
 # ---------------- cfg ----------------
@@ -100,51 +111,120 @@ def _safe_mask(mask: torch.Tensor, cfg: DenoiseSTFTCfg) -> torch.Tensor:
     return mask.clamp(min=cfg.mask_floor, max=cfg.mask_limit)
 
 
-def _variant_from_head(head_out: torch.Tensor, variant: str, cfg: DenoiseSTFTCfg):
+import torch
+
+def _variant_from_head(
+    head: torch.Tensor,          # (B,2,F,T) from the model head
+    variant: str,                # 'complex_delta' | 'complex' | 'mag_sigmoid' | 'mag' | 'mag_delta1'
+    cfg,                         # task cfg: may have mask_floor, mask_limit, clamp_mask_tanh
+    compute_stats: bool = False  # set True only if you want scalar stats (will be skipped under compile)
+) -> tuple[torch.Tensor, dict]:
     """
-    Convert raw head_out (B, C, F, T) to a mask of shape (B, F, T):
-      - magnitude mask: real tensor in [mask_floor, mask_limit]
-      - complex mask:   complex64 tensor with amplitude clamped to [floor, limit]
+    Map raw head outputs -> complex mask M = R + j I  (shape (B,2,F,T)).
+
+    Variants
+    --------
+    - 'complex_delta' (alias: 'delta1', 'delta1_complex'):
+        R = 1 + Mr,  I = Mi  (identity-anchored complex mask; yhat≈noisy at init)
+    - 'complex' / 'plain':
+        R = Mr,      I = Mi  (plain complex mask; often attenuates early if head starts near 0)
+    - 'mag_sigmoid':
+        Mag = 1 + (sigmoid(Mr) - 0.5) * 2  in [0, 2] ;  I = 0
+    - 'mag':
+        Mag = sqrt(Mr^2 + Mi^2) ; I = 0
+    - 'mag_delta1':
+        Mag = 1 + sqrt(Mr^2 + Mi^2) ; I = 0
+
+    Post mapping guards (optional in cfg):
+      - mask_floor        : minimum magnitude (>=0)   – floors |M|
+      - mask_limit        : maximum magnitude (>0)    – caps   |M|
+      - clamp_mask_tanh   : component clamp via tanh  – clamps R and I to [-c, +c]
+
+    Returns
+    -------
+    mask_b2ft : torch.Tensor (B,2,F,T)
+    stats     : dict[str, float] (empty when compiling or compute_stats=False)
     """
-    stats = {}
-    v = (variant or "mag_sigmoid").lower()
-    B, C, F, T = head_out.shape
+    Mr = head[:, 0]
+    Mi = head[:, 1]
+    v  = str(variant).lower()
 
-    if v in ("mag_sigmoid", "mag", "mag_delta1", "delta1"):
-        if v == "mag_sigmoid":
-            m = torch.sigmoid(head_out[:, 0:1])  # (B,1,F,T)
-            mask = cfg.mask_floor + (cfg.mask_limit - cfg.mask_floor) * m
-        elif v == "mag_delta1":
-            mask = 1.0 + head_out[:, 0:1]
-            mask = mask.clamp(min=cfg.mask_floor, max=cfg.mask_limit)
-        elif v == "delta1":
-            mask = 1.0 + torch.tanh(head_out[:, 0:1])
-            mask = mask.clamp(min=cfg.mask_floor, max=cfg.mask_limit)
-        else:  # "mag"
-            m = torch.sigmoid(head_out[:, 0:1])
-            mask = cfg.mask_floor + (cfg.mask_limit - cfg.mask_floor) * m
+    # ---- mapping ----
+    if v in ("complex_delta", "delta1", "delta1_complex"):
+        # identity-anchored complex mask
+        R = 1.0 + Mr
+        I = Mi
+    elif v in ("complex", "plain"):
+        R = Mr
+        I = Mi
+    elif v in ("mag_sigmoid", "mag_sigm1"):
+        Mag = 1.0 + (torch.sigmoid(Mr) - 0.5) * 2.0  # [0, 2]
+        R = Mag
+        I = torch.zeros_like(Mr)
+    elif v == "mag_delta1":
+        Mag = 1.0 + torch.sqrt(Mr * Mr + Mi * Mi + 1e-8)
+        R = Mag
+        I = torch.zeros_like(Mr)
+    elif v == "mag":
+        Mag = torch.sqrt(Mr * Mr + Mi * Mi + 1e-8)
+        R = Mag
+        I = torch.zeros_like(Mr)
+    else:
+        # sensible default: plain complex
+        R = Mr
+        I = Mi
 
-        # SQUEEZE channel -> (B,F,T)
-        mask = mask[:, 0]
-        stats["mask_min"] = float(mask.min().item())
-        stats["mask_max"] = float(mask.max().item())
-        return mask, stats
+    # ---- optional component clamp via tanh (before magnitude guards) ----
+    c_tanh = float(getattr(cfg, "clamp_mask_tanh", 0.0) or 0.0)
+    if c_tanh > 0.0:
+        R = torch.tanh(R) * c_tanh
+        I = torch.tanh(I) * c_tanh
 
-    # complex variants -> (B,F,T) complex
-    if C < 2:
-        # duplicate real into imaginary if missing
-        z = torch.zeros_like(head_out[:, 0:1])
-        head_out = torch.cat([head_out[:, 0:1], z], dim=1)
+    # ---- magnitude floor/limit (on |M|) ----
+    mag = torch.sqrt(R * R + I * I + 1e-12)
 
-    Mr = head_out[:, 0]
-    Mi = head_out[:, 1]
-    M = torch.complex(Mr, Mi)
-    # amplitude clamp -> [floor, limit]
-    amp = torch.abs(M)
-    M = M * (amp.clamp(min=cfg.mask_floor, max=cfg.mask_limit) / (amp + cfg.eps))
-    stats["mask_amp_min"] = float(amp.min().item())
-    stats["mask_amp_max"] = float(amp.max().item())
-    return M, stats
+    # floor first (push small magnitudes up)
+    floor = float(getattr(cfg, "mask_floor", 0.0) or 0.0)
+    if floor > 0.0:
+        # scale samples with mag < floor up to exactly 'floor'
+        scale_up = torch.clamp(floor / mag, max=1e6)  # avoid INF
+        mask = mag < floor
+        if mask.any():
+            R = torch.where(mask, R * scale_up, R)
+            I = torch.where(mask, I * scale_up, I)
+            mag = torch.sqrt(R * R + I * I + 1e-12)
+
+    # then cap (push large magnitudes down)
+    limit = float(getattr(cfg, "mask_limit", 0.0) or 0.0)
+    if limit > 0.0:
+        scale_dn = torch.clamp(limit / mag, max=1.0)
+        R = R * scale_dn
+        I = I * scale_dn
+        # (no need to recompute 'mag' unless you want it in stats)
+
+    mask_b2ft = torch.stack([R, I], dim=1)
+
+    # ---- optional stats (avoid graph breaks under torch.compile) ----
+    stats: dict[str, float] = {}
+    if compute_stats:
+        try:
+            import torch._dynamo as dynamo
+            compiling = bool(getattr(dynamo, "is_compiling", lambda: False)())
+        except Exception:
+            compiling = False
+        if not compiling:
+            with torch.no_grad():
+                # use detach().cpu() and safe float conversion
+                def _sf(x):
+                    try:
+                        return float(x.detach().cpu().mean().item())
+                    except Exception:
+                        return float("nan")
+                stats["mask_R_mean"] = _sf(R)
+                stats["mask_I_mean"] = _sf(I)
+                stats["mask_mag_mean"] = _sf(torch.sqrt(R * R + I * I + 1e-12))
+    return mask_b2ft, stats
+
 
 
 # ------------- main task -------------
@@ -206,31 +286,49 @@ class DenoiseSTFTMusic(nn.Module):
         # ------------------------------------------------------
 
         # STFT
-        S = _stft(noisy_bt, self.cfg)  # (B,F,T) complex
-        mag = torch.abs(S)
+        win = torch.hann_window(self.cfg.win_length, device=noisy_bt.device, dtype=torch.float32)
+        X = torch.stft(
+            noisy_bt.to(torch.float32), n_fft=self.cfg.n_fft,
+            hop_length=self.cfg.hop_length, win_length=self.cfg.win_length,
+            window=win, center=True, return_complex=True
+        )  # (B,F,T) complex64
 
-        # choose input repr based on model in_channels
-        if self._in_ch >= 2:
-            x_in = torch.stack([S.real, S.imag], dim=1)  # (B,2,F,T)
-        else:
-            x_in = torch.log1p(mag).unsqueeze(1)  # (B,1,F,T)
+        # real/imag for the model input (B,2,F,T)
+        Xri = torch.view_as_real(X).permute(0, 3, 1, 2).contiguous()  # (B,2,F,T), float32
 
-        head = self.model(x_in)  # (B,C_out,F,T)
-        M, mstats = _variant_from_head(head, self.cfg.mask_variant, self.cfg)
+        # --- model head ---
+        head = self.model(Xri)  # (B,2,F,T) float
+        Mri, mstats = _variant_from_head(  # your mapper, e.g. 'complex_delta'
+            head, self.cfg.mask_variant, self.cfg, compute_stats=False
+        )
+        # right after: Mri, mstats = _variant_from_head(...)
+        if not hasattr(self, "_mask_probe_done") and (self.training is True):
+            with torch.no_grad():
+                R = Mri[:, 0];
+                I = Mri[:, 1]
+                devR = (R - 1.0).abs().mean().item()
+                devI = I.abs().mean().item()
+                print(f"[mask] mean|R-1|={devR:.4e} | mean|I|={devI:.4e}")
+            self._mask_probe_done = True
 
-        if torch.is_complex(M):
-            Shat = S * M  # (B,F,T) complex
-        else:
-            pha = torch.angle(S)
-            mag_hat = mag * M  # (B,F,T)
-            Shat = torch.polar(mag_hat, pha)
+        # --- build complex mask and apply (stay complex thereafter) ---
+        # match dtypes to X.real; keep complex64 for ISTFT
+        R = Mri[:, 0].to(X.real.dtype)  # (B,F,T) float
+        I = Mri[:, 1].to(X.real.dtype)  # (B,F,T) float
+        M = torch.complex(R, I)  # (B,F,T) complex
+        Shat = M * X  # (B,F,T) complex
 
-        yhat = _istft(Shat, self.cfg, length=T)  # (B,T)
+        # --- ISTFT ---
+        yhat = torch.istft(
+            Shat, n_fft=self.cfg.n_fft,
+            hop_length=self.cfg.hop_length, win_length=self.cfg.win_length,
+            window=win, center=True, length=T, return_complex=False
+        )  # (B,T) float32
 
         if self.cfg.safe_unity_fallback and not torch.isfinite(yhat).all():
             yhat = noisy_bt.clone()
 
-        out = {"yhat": yhat}
+        out = {"yhat": yhat, "R": R, "I": I}
         if self.cfg.return_debug:
             out["debug"] = {"mask_stats": mstats}
         return out

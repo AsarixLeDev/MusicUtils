@@ -7,27 +7,28 @@ data:
   val_manifest:   manifests/music_stems_val.jsonl
   sr: 48000
   crop: 3.0
-  mono: true     # ✔ works, but note the task currently mixes channels to mono for STFT.
-                 #    If you want *true stereo denoising*, we’d need to keep channels and map masks per channel.
-                 #    For overfit sanity, consider mono:true for speed/consistency.
-  fixed_index: 0        # always train on item 0
+  mono: true                # <- use mono for strict overfit sanity
   batch: 1
   workers: 0
-  prefetch_factor: 2
   pin_memory: true
+  prefetch_factor: 2
   persistent_workers: false
 
+  # deterministic sample & crop
+  fixed_index: 0
+  fixed_crop_sec: 12.0   # not the intro
+  fixed_val_index: 0
+  fixed_val_crop_sec: 0.0
+
+  # no external noise
   noise_manifests: []
   use_ext_noise_p: 0.0
   p_clean: 0.0
   out_peak: 0.98
 
 model:
-  name: music_unet
-  args:
-    base: 48
-    depth: 5
-    out_ch: 1            # ✔ output 1-channel mask; task averages to mono anyway
+  name: complex_unet_auto
+  args: { base: 48, depth: 5, out_ch: 2 }
 
 task:
   name: denoise_stft_music
@@ -35,27 +36,33 @@ task:
     n_fft: 1024
     hop_length: 256
     win_length: 1024
-    mask_variant: mag_sigmoid
-    mask_floor: 0.30
-    mask_limit: 1.80
+    mask_variant: complex_delta   # <— new
+    mask_limit: 2.0
     clamp_mask_tanh: 0.0
+    mask_floor: 0.0
     safe_unity_fallback: true
-    return_debug: false  # ✔
+    return_debug: false
 
 losses:
   items:
-    - { name: l1_wave, weight: 1.00 }    # ✔ simple overfit sanity; MR-STFT can be added later
+    - { name: l1_wave, weight: 1.0 }
+    - { name: mrstft,  weight: 0.20,
+        args: { fft_sizes: [ 512, 1024 ], hops: [ 128, 256 ], win_lengths: [ 512, 1024 ], center: true } }
+    - { name: lsd,     weight: 0.10,  args: { n_fft: 1024, hop: 256, win: 1024, p: 2 } }
+    - { name: mask_unity_reg,  weight: 0.05 }   # penalize ||M|-1|
+    # - { name: sisdr_pos, weight: 0.20, args: { target_db: 20.0 } }  # add once L1/MRSTFT are behaving
 
 optim:
   lr: 1.0e-3
+  warmup_steps: 0
+  lr_min_factor: 1.0
   wd: 0.0
   grad_clip: 0.0
   grad_accum: 1
-  warmup_steps: 0
-  lr_min_factor: 1.0
+  use_scheduler: false
 
 train:
-  epochs: 5
+  epochs: 1
   save_every: 1
   ema: 0.0
 
@@ -63,23 +70,13 @@ callbacks:
   proc_noise:
     enable: true
     prob: 1.0
-    snr_min: 8.0
-    snr_max: 8.0
+    snr_min: 3.0
+    snr_max: 3.0
     fixed_seed: 1234
-    fixed_per_epoch: true
-    require_replace: true   # ✔ fail-fast if a batch is still clean
-    train_only: true        # NOTE: validation (audio_debug) will be clean. For noisy debug, set false temporarily.
-
-  audio_debug:
-    enable: true
-    per_epoch: 3
-    scan_batches: 16
-
-  data_audit:
-    enable: true
-    max_items: 12
-    take_from_batches: 6
-
+    fixed_per_epoch: true   # identical across epochs too
+    require_replace: true
+    train_only: true
+    out_peak: null           # do NOT re-peak normalize (keeps residual strictly fixed)
   save_preds:
     enable: true
     args:
@@ -87,19 +84,30 @@ callbacks:
       per_batch: 1
       max_total: 50
       save_triads: true
-      out_subdir: logs/pred_dumps
+  audio_debug:
+    enable: true
+    per_epoch: 1
+    scan_batches: 8
+  data_audit:
+    enable: true
+    max_items: 6
+    take_from_batches: 3
 
 hard_mining: { enable: false }
 
 debug:
   overfit_steps: 2000
-  val_every: 1
-  val_max_batches: 2
-  pbar_every: 8
+  overfit_fixed_index: 0       # <— ensure the same item each run (trainer must support it)
+  val_every: 1000
+  val_max_batches: 1
+  pbar_every: 10
   print_comp: true
+  print_sisdr: true
+  constant_lr: true
+  freeze_bn: true
 
 runtime:
-  amp: float32           # ✔ for sanity; later you can use bfloat16 for speed if your GPU supports it
+  amp: float32               # <- keep FP32; bfloat16 can wait
   channels_last: true
   cuda_graph: false
   compile: false

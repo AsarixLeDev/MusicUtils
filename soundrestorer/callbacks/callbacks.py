@@ -1,11 +1,11 @@
 # ---- Legacy callback base (for core.callbacks compatibility) ----
 class Callback:
     # new-style hooks (your current trainer uses these)
-    def on_fit_begin(self, trainer): pass
-    def on_fit_end(self, trainer): pass
-    def on_epoch_begin(self, trainer, epoch: int): pass
-    def on_epoch_end(self, trainer, epoch: int): pass
-    def on_train_batch_end(self, trainer, batch_idx: int, batch, outputs): pass
+    def on_fit_begin(self, trainer, **_): pass
+    def on_fit_end(self, trainer, **_): pass
+    def on_epoch_begin(self, trainer, epoch: int, **_): pass
+    def on_epoch_end(self, trainer, epoch: int, **_): pass
+    def on_train_batch_end(self, trainer, batch_idx: int, batch, outputs, **_): pass
 
     # legacy hooks (used by soundrestorer.core.callbacks.*)
     def on_epoch_start(self, trainer=None, state=None, **_): pass

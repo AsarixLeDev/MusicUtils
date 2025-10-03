@@ -8,7 +8,7 @@ from ..core.registry import MODELS
 @MODELS.register("complex_unet_auto")
 class AutoComplexUNet(torch.nn.Module):
     def __init__(self, base=48, prefer_temporal=True, min_free_mem_mb=3000,
-                 lstm_hidden=128, lstm_layers=2, bidirectional=True):
+                 lstm_hidden=128, lstm_layers=2, bidirectional=True, **_):
         super().__init__()
         want_lstm = bool(prefer_temporal)
         if want_lstm and torch.cuda.is_available():

@@ -11,32 +11,22 @@ from ..metrics.common import _stft_mag, _as_bt  # keep using the centralized hel
 
 
 class MRSTFTLoss(nn.Module):
-    """
-    Multi-resolution STFT loss:
-      For each resolution r:
-        L_r = alpha * L1(|Y|-|T|) + beta * SC(|Y|,|T|)
-      MRSTFT = mean_r L_r
-
-      SC (spectral convergence) = || |Y|-|T| ||_F / (|| |T| ||_F + eps)
-
-    All terms are non-negative and → 0 when yhat == clean (up to numerical floors).
-    """
-
     def __init__(self,
-                 fft_sizes: List[int] = (1024, 2048, 512),
-                 hops: List[int] = (256, 512, 128),
-                 win_lengths: List[int] = (1024, 2048, 512),
+                 fft_sizes=(1024, 512, 2048),
+                 hops=(256, 128, 512),
+                 win_lengths=(1024, 512, 2048),
                  alpha: float = 0.5,
-                 beta: float = 0.5,
+                 beta: float  = 0.5,
                  center: bool = True,
-                 eps: float = 1e-8):
+                 eps: float   = 1e-8,
+                 **_):   # <-- swallow mag_loss/logmag_loss or any extra keys
         super().__init__()
         assert len(fft_sizes) == len(hops) == len(win_lengths), "MRSTFT: list lengths must match."
-        self.fft_sizes = [int(v) for v in fft_sizes]
-        self.hops = [int(v) for v in hops]
+        self.fft_sizes   = [int(v) for v in fft_sizes]
+        self.hops        = [int(v) for v in hops]
         self.win_lengths = [int(v) for v in win_lengths]
         self.alpha = float(alpha)
-        self.beta = float(beta)
+        self.beta  = float(beta)
         self.center = bool(center)
         self.eps = float(eps)
 

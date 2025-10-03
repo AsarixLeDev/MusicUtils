@@ -60,13 +60,16 @@ def _resample_if_needed(wav: torch.Tensor, sr: int, target_sr: int) -> torch.Ten
     return torchaudio.functional.resample(wav, sr, target_sr)
 
 
-def _crop_or_pad(wav: torch.Tensor, target_len: int, rng: random.Random) -> torch.Tensor:
+def _crop_or_pad(wav: torch.Tensor, target_len: int, rng: random.Random, fixed_crop_start: int) -> torch.Tensor:
     # wav: (1, T)
     T = wav.size(-1)
     if T == target_len:
         return wav
     if T > target_len:
-        start = rng.randint(0, max(0, T - target_len))
+        if fixed_crop_start is not None:
+            start = fixed_crop_start
+        else:
+            start = rng.randint(0, max(0, T - target_len))
         return wav[..., start:start + target_len]
     # pad (loop or zero)
     reps = (target_len + T - 1) // T
@@ -105,6 +108,8 @@ class MusicDenoiseDataset(Dataset):
                  noise_manifests: Optional[List[Path]] = None,
                  train: bool = True):
         super().__init__()
+        self._fixed_crop_start: int | None = None  # in samples; None = random
+
         self.clean_rows = _load_jsonl(Path(manifest_clean))
         self.train = train
 
@@ -130,6 +135,13 @@ class MusicDenoiseDataset(Dataset):
         # pre-create RNG
         self.rng = random.Random()
 
+    def set_fixed_crop_sec(self, start_sec: float | int | None):
+        if start_sec is None:
+            self._fixed_crop_start = None
+        else:
+            start = float(start_sec)
+            self._fixed_crop_start = max(0, int(round(start * self.cfg.sr)))
+
     def __len__(self) -> int:
         return len(self.clean_rows)
 
@@ -145,10 +157,10 @@ class MusicDenoiseDataset(Dataset):
         wav = _resample_if_needed(wav, sr, self.cfg.sr)
         # retry a few times to avoid silent segments if possible
         for _ in range(self.cfg.max_silence_retries):
-            crop = _crop_or_pad(wav, T_target, self.rng)
+            crop = _crop_or_pad(wav, T_target, self.rng, self._fixed_crop_start)
             if _rms_db_float(crop) > self.cfg.silence_rms_db:
                 return crop
-        return _crop_or_pad(wav, T_target, self.rng)
+        return _crop_or_pad(wav, T_target, self.rng, self._fixed_crop_start)
 
     def _sample_noise_wave(self, T_target: int) -> Optional[torch.Tensor]:
         if not self.noise_rows:
@@ -158,7 +170,7 @@ class MusicDenoiseDataset(Dataset):
         if self.cfg.mono:
             wav = to_mono(wav)
         wav = _resample_if_needed(wav, sr, self.cfg.sr)
-        return _crop_or_pad(wav, T_target, self.rng)
+        return _crop_or_pad(wav, T_target, self.rng, self._fixed_crop_start)
 
     # --------- mixing ---------
     def _mix(self, clean: torch.Tensor) -> Tuple[torch.Tensor, float, float]:
@@ -205,12 +217,12 @@ class MusicDenoiseDataset(Dataset):
         if T_target:
             # try not-silent crop
             for _ in range(self.cfg.max_silence_retries):
-                crop = _crop_or_pad(wav_clean, T_target, self.rng)
+                crop = _crop_or_pad(wav_clean, T_target, self.rng, self._fixed_crop_start)
                 if _rms_db_float(crop) > self.cfg.silence_rms_db:
                     wav_clean = crop
                     break
             else:
-                wav_clean = _crop_or_pad(wav_clean, T_target, self.rng)
+                wav_clean = _crop_or_pad(wav_clean, T_target, self.rng, self._fixed_crop_start)
 
         noisy, snr_db, noise_rms_db = self._mix(wav_clean)
 

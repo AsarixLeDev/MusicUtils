@@ -7,7 +7,7 @@ from ..core.registry import MODELS
 
 @MODELS.register("complex_unet_lstm")
 class ComplexUNetLSTM(nn.Module):
-    def __init__(self, base=48, lstm_hidden=128, lstm_layers=2, bidirectional=True, dropout=0.0):
+    def __init__(self, base=48, lstm_hidden=128, lstm_layers=2, bidirectional=True, dropout=0.0, **_):
         super().__init__()
         self.net = _ComplexUNet(base=int(base))  # stays fp32 by default
         self.lstm_hidden = int(lstm_hidden)
